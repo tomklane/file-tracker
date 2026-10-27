@@ -1,0 +1,126 @@
+# Builds File Tracker for macOS and Windows.
+#
+# - Every push to main: runs the tests and builds both apps. The apps are
+#   attached to the run under "Artifacts".
+# - Pushing a version tag (e.g. v1.0.1): also publishes a GitHub Release with
+#   the downloads, so they show up on the repository's Releases page.
+# - "Run workflow" on the Actions tab builds on demand.
+name: Build File Tracker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Make sample folder and spreadsheets
+        run: |
+          pip install openpyxl
+          python tests/make_fixture.py "$RUNNER_TEMP/ft_sandbox"
+      - name: Run tests
+        run: cargo test -- --nocapture
+        env:
+          FT_SANDBOX: ${{ runner.temp }}/ft_sandbox
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build universal app (Apple Silicon + Intel)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/file_tracker \
+            target/x86_64-apple-darwin/release/file_tracker \
+            -output target/release/file_tracker
+          bash build_mac.sh --skip-build
+          cd dist
+          ditto -c -k --keepParent "File Tracker.app" File-Tracker-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-Tracker-Mac
+          path: dist/File-Tracker-Mac.zip
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/file_tracker.exe dist/File-Tracker-Windows.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-Tracker-Windows
+          path: dist/File-Tracker-Windows.exe
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package the Python version
+        run: |
+          mkdir -p dist
+          cd python && zip -r ../dist/File-Tracker-Python.zip . -x '.*'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-Tracker-Python
+          path: dist/File-Tracker-Python.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, python]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: File Tracker ${{ github.ref_name }}
+          files: |
+            dist/File-Tracker-Mac.zip
+            dist/File-Tracker-Windows.exe
+            dist/File-Tracker-Python.zip
+          body: |
+            ## Downloads
+            - **Mac** (Apple Silicon and Intel): `File-Tracker-Mac.zip`. Unzip it and drag **File Tracker** to Applications.
+            - **Windows**: `File-Tracker-Windows.exe`. It's a single file with nothing to install.
+            - **Python version** (needs Python 3): `File-Tracker-Python.zip`.
+
+            ### First launch
+            These apps aren't signed by Apple or Microsoft, so the first launch needs one extra step:
+            - **Mac:** open the app once. When macOS blocks it, go to **System Settings › Privacy & Security**, scroll down and click **Open Anyway**.
+            - **Windows:** if SmartScreen appears, click **More info › Run anyway**.
