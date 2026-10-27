@@ -1,10 +1,12 @@
 # Builds File Tracker for macOS and Windows.
 #
-# - Every push to main: runs the tests and builds both apps. The apps are
-#   attached to the run under "Artifacts".
-# - Pushing a version tag (e.g. v1.0.1): also publishes a GitHub Release with
-#   the downloads, so they show up on the repository's Releases page.
-# - "Run workflow" on the Actions tab builds on demand.
+# - Every push to main: runs the tests, builds both apps and publishes them on
+#   the Releases page as "v<version>", using the version in Cargo.toml.
+#   Bump that version to make a new release; pushing again without bumping
+#   refreshes the downloads of the current release.
+# - Pushing a version tag (e.g. v1.0.1) also publishes that release.
+# - "Run workflow" on the Actions tab builds and publishes on demand.
+# - Pull requests are only built and tested, never published.
 name: Build File Tracker
 
 on:
@@ -98,10 +100,20 @@ jobs:
           path: dist/File-Tracker-Python.zip
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [macos, windows, python]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Work out the version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            echo "tag=v$ver" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -109,7 +121,11 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          name: File Tracker ${{ github.ref_name }}
+          tag_name: ${{ steps.v.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: File Tracker ${{ steps.v.outputs.tag }}
+          make_latest: true
+          overwrite_files: true
           files: |
             dist/File-Tracker-Mac.zip
             dist/File-Tracker-Windows.exe

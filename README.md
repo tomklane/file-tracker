@@ -63,16 +63,15 @@ Your setup is remembered between runs. Use **Save setup…** and
 
 ## Making a new release
 
-Builds run automatically on GitHub:
+Builds run automatically on GitHub every time you push to `main`:
 
-- **Every push to `main`** runs the tests and builds both apps. You can
-  download them from that run on the **Actions** tab, under **Artifacts**.
-- **Pushing a version tag** publishes a new release on the Releases page:
-  ```
-  git tag v1.0.1
-  git push origin v1.0.1
-  ```
-  Also update `version` in `Cargo.toml` to match.
+1. Change `version` in `Cargo.toml` (e.g. `1.0.0` → `1.0.1`).
+2. Commit and push to `main`.
+
+About 10 minutes later, **File Tracker v1.0.1** appears on the Releases page
+with fresh downloads. If you push without changing the version, the current
+release's downloads are rebuilt in place. Each run's builds are also
+available on the **Actions** tab, under **Artifacts**.
 
 ## Building it yourself
 
