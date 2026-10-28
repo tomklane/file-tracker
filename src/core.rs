@@ -166,6 +166,26 @@ pub fn load_settings(path: &Path) -> Option<Settings> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
+/// Read a saved setup, whatever its file is called (downloads sometimes end
+/// up as .json.txt or with no extension). Only accepts real File Tracker setups.
+pub fn read_setup(path: &Path) -> Result<Settings, String> {
+    let raw = fs::read(path).map_err(|e| format!("Couldn't open that file ({e})."))?;
+    let text = String::from_utf8_lossy(&raw);
+    let text = text.trim_start_matches('\u{feff}');
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|_| "That file isn't a File Tracker setup.".to_string())?;
+    let known = ["mapping", "row_mode", "folder", "sheet_mode", "new_columns", "key_header"];
+    if !v.as_object().map(|o| known.iter().any(|k| o.contains_key(*k))).unwrap_or(false) {
+        return Err("That file isn't a File Tracker setup.".into());
+    }
+    serde_json::from_value(v).map_err(|e| format!("That setup couldn't be read ({e})."))
+}
+
+/// Does this look like a setup file (for files dropped onto the window)?
+pub fn is_setup_file(path: &Path) -> bool {
+    let small = fs::metadata(path).map(|m| m.len() < 2_000_000).unwrap_or(false);
+    small && read_setup(path).is_ok()
+}
+
 pub fn save_settings(s: &Settings, path: &Path) {
     if let Ok(txt) = serde_json::to_string_pretty(s) {
         let _ = fs::write(path, txt);
@@ -1805,6 +1825,25 @@ mod tests {
         assert!(matches!(field_value("size_h", "", &big, &ctx), Val::Text(t) if t == "2.35 TB"));
         assert!(matches!(field_value("count", "", &lvl[0], &ctx), Val::Num(v) if v == 3.0));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn setups_load_whatever_their_name() {
+        let dir = std::env::temp_dir().join(format!("ft-setup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let good = r#"{"folder":"","row_mode":"pattern","mapping":{"CAM OP":["name",""]}}"#;
+        for name in ["a.json", "a.json.txt", "a"] {
+            let p = dir.join(name);
+            fs::write(&p, format!("\u{feff}{good}")).unwrap();
+            let s = read_setup(&p).unwrap();
+            assert_eq!(s.row_mode, "pattern");
+            assert!(is_setup_file(&p));
+        }
+        fs::write(dir.join("other.json"), r#"{"name":"some other app"}"#).unwrap();
+        assert!(read_setup(&dir.join("other.json")).is_err());
+        fs::write(dir.join("text.json"), "hello").unwrap();
+        assert!(!is_setup_file(&dir.join("text.json")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

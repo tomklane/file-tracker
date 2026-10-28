@@ -1,6 +1,6 @@
 [package]
 name = "file_tracker"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 description = "Scan a folder and fill a tracking spreadsheet, or copy the list into any spreadsheet."
 

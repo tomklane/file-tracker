@@ -404,10 +404,39 @@ impl App {
         self.load_columns(true, false);
     }
 
-    /// A folder or spreadsheet dropped onto the window.
+    /// Load a saved setup. A setup without a folder or spreadsheet keeps the
+    /// ones already chosen, so a shared setup can be dropped onto any project.
+    fn load_setup(&mut self, f: &Path) {
+        match read_setup(f) {
+            Ok(mut s) => {
+                if s.folder.trim().is_empty() {
+                    s.folder = self.s.folder.clone();
+                }
+                if s.sheet_path.trim().is_empty() && s.sheet_mode == "existing" {
+                    s.sheet_path = self.s.sheet_path.clone();
+                }
+                s.show_sidebar = true;
+                self.s = s;
+                self.last_row_mode = self.s.row_mode.clone();
+                self.apply_sheet_mode(true);
+                let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+                self.status = format!("Loaded setup “{name}”.");
+                self.grid.copy_msg = if self.s.folder.trim().is_empty() || (self.s.sheet_mode == "existing" && self.s.sheet_path.trim().is_empty()) {
+                    format!("Loaded “{name}”. Now choose the folder (📁) and spreadsheet (📊) in the top bar.")
+                } else {
+                    format!("Loaded “{name}”.")
+                };
+            }
+            Err(e) => error(&e),
+        }
+    }
+
+    /// A folder, spreadsheet or saved setup dropped onto the window.
     fn dropped(&mut self, paths: Vec<PathBuf>) {
         for p in paths {
-            if p.is_dir() {
+            if p.is_file() && is_setup_file(&p) {
+                self.load_setup(&p);
+            } else if p.is_dir() {
                 self.s.folder = p.display().to_string();
             } else if matches!(
                 p.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(),
@@ -1111,8 +1140,7 @@ impl App {
             Action::BrowseSheet => {
                 let mut d = FileDialog::new()
                     .set_title("Choose your tracking spreadsheet")
-                    .add_filter("Spreadsheets", &["xlsx", "xlsm", "csv", "tsv"])
-                    .add_filter("All files", &["*"]);
+                    .add_filter("Spreadsheets", &["xlsx", "xlsm", "csv", "tsv"]);
                 if let Some(parent) = Path::new(&self.s.sheet_path).parent().filter(|p| p.is_dir()) {
                     d = d.set_directory(parent);
                 } else if Path::new(&self.s.folder).is_dir() {
@@ -1141,17 +1169,9 @@ impl App {
                 }
             }
             Action::LoadSetup => {
-                if let Some(f) =
-                    FileDialog::new().set_title("Load a saved setup").add_filter("File Tracker setup", &["json"]).pick_file()
-                {
-                    match load_settings(&f) {
-                        Some(s) => {
-                            self.s = s;
-                            self.apply_sheet_mode(false);
-                            self.status = format!("Loaded setup {}.", f.file_name().unwrap_or_default().to_string_lossy());
-                        }
-                        None => error("That file isn't a File Tracker setup."),
-                    }
+                // no file-type filter: downloaded setups sometimes get a different ending
+                if let Some(f) = FileDialog::new().set_title("Load a saved setup").pick_file() {
+                    self.load_setup(&f);
                 }
             }
             Action::OpenSheet => {

@@ -67,6 +67,10 @@ impl App {
                     self.pending = Some(Action::UseNewColumns);
                     ui.close();
                 }
+                if ui.button("Load a saved setup…").on_hover_text("Or drag a setup file onto the window").clicked() {
+                    self.pending = Some(Action::LoadSetup);
+                    ui.close();
+                }
                 if self.s.sheet_mode == "existing" && Path::new(self.s.sheet_path.trim()).is_file() {
                     if self.sheets.len() > 1 {
                         ui.separator();
@@ -404,7 +408,7 @@ impl App {
                 if ui.button("Save setup…").on_hover_text("Keep these settings in a file, e.g. one per project").clicked() {
                     self.pending = Some(Action::SaveSetup);
                 }
-                if ui.button("Load setup…").clicked() {
+                if ui.button("Load setup…").on_hover_text("Or drag a setup file onto the window").clicked() {
                     self.pending = Some(Action::LoadSetup);
                 }
             });
@@ -511,7 +515,7 @@ impl App {
                 ui.painter().text(
                     screen.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Drop a folder to scan it, or a spreadsheet to use its columns",
+                    "Drop a folder to scan it, a spreadsheet to use its columns, or a saved setup to load it",
                     egui::FontId::proportional(20.0),
                     ui.visuals().strong_text_color(),
                 );
