@@ -40,11 +40,17 @@ folder.
 
 1. **Folder to scan.** Choose the top folder. You can limit it to file types
    (`pdf, docx`) or skip names (`*.tmp, Archive, Old*`).
+   **Each row is** a file, **a folder at a level** (e.g. level 1 = every
+   folder directly inside, such as each shot or project folder), or **each
+   folder with files in it** (e.g. every image-sequence folder, at whatever
+   depth). Folder rows are sized by adding up everything inside them, and
+   "Date modified" is the newest file inside.
 2. **Tracking spreadsheet.** Choose your existing tracker. The app finds the
    header row itself, even below a title, and you can change it. Or choose
    **Start from new columns** and type the column names you want.
 3. **What goes in each column.** Choose from: file name, folder, path,
-   clickable link, size, dates, a running ID (`DOC-###`), Present/Missing,
+   clickable link, size (automatic units, or exactly in KB, MB, GB or TB),
+   number of files, dates, a running ID (`DOC-###`), Present/Missing,
    fixed text, or **Custom** (below). Columns left on **leave as is** stay
    blank in the grid and are never touched in your sheet.
 4. **Copy from the grid.** The grid shows your sheet's column letters and
@@ -105,6 +111,14 @@ Your setup is remembered between runs. Use **Save setup…** and
 **Load setup…** to keep one setup per project.
 
 ### Good to know
+
+- **Sizes** can follow Finder (1 KB = 1,000 bytes, the default on a Mac) or
+  Windows (1 KB = 1,024 bytes, the default on Windows), set under Options, so
+  the numbers match what you see on your computer.
+- Mac items that Finder shows as single files but are really folders (apps,
+  Final Cut Pro / Photos / Logic libraries and similar) are listed as one
+  item, sized by their whole contents.
+- Shortcuts (symlinks) to files are sized by the file they point to.
 
 - Close the spreadsheet in Excel before clicking **Update spreadsheet**.
 - New rows copy the formatting of the first data row. Excel tables and

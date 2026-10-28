@@ -235,7 +235,8 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
                 ui.colored_label(HINT, "/");
             }
             let file_sel = matches!(r.source, Source::FileName | Source::Stem | Source::Extension);
-            if chip(ui, &format!("📄 {}", s.name), file_sel).on_hover_text("The file name").clicked() && !file_sel {
+            let (icon, tip) = if s.is_folder { ("📁", "This row's folder name") } else { ("📄", "The file name") };
+            if chip(ui, &format!("{icon} {}", s.name), file_sel).on_hover_text(tip).clicked() && !file_sel {
                 r.source = Source::Stem;
             }
         });

@@ -32,7 +32,7 @@ macro_rules! f {
 
 pub const FIELDS: &[FieldDef] = &[
     f!("", "— leave as is —"),
-    f!("name", "File name"),
+    f!("name", "File name (or folder name)"),
     f!("stem", "File name without extension"),
     f!("part", "Part of the file name", "1", "1 = first part, -1 = last"),
     f!("ext", "Extension (pdf)"),
@@ -46,7 +46,10 @@ pub const FIELDS: &[FieldDef] = &[
     f!("size_h", "Size (e.g. 2.4 MB)"),
     f!("size_kb", "Size in KB"),
     f!("size_mb", "Size in MB"),
+    f!("size_gb", "Size in GB"),
+    f!("size_tb", "Size in TB"),
     f!("size_b", "Size in bytes"),
+    f!("count", "Number of files (in a folder)"),
     f!("modified_d", "Date modified"),
     f!("modified", "Date & time modified"),
     f!("created_d", "Date created"),
@@ -108,6 +111,11 @@ pub struct Settings {
     pub check_updates: bool,
     /// a release the user chose to skip
     pub skip_version: String,
+    /// what each row is: "files", "level" (folders at folder_level) or "withfiles"
+    pub row_mode: String,
+    pub folder_level: u32,
+    /// 1000 (like Finder) or 1024 (like Windows)
+    pub size_base: u32,
     /// header text -> [field key, setting]
     pub mapping: HashMap<String, (String, String)>,
 }
@@ -137,6 +145,9 @@ impl Default for Settings {
             sort_desc: false,
             check_updates: true,
             skip_version: String::new(),
+            row_mode: "files".into(),
+            folder_level: 1,
+            size_base: default_size_base(),
             mapping: HashMap::new(),
         }
     }
@@ -229,15 +240,31 @@ fn to_int(s: &str, d: i64) -> i64 {
     s.trim().parse().unwrap_or(d)
 }
 
-pub fn human_size(n: u64) -> String {
+/// Sizes the way Finder (1 KB = 1,000 bytes) or Windows (1 KB = 1,024 bytes) shows them.
+pub fn human_size(n: u64, base: f64) -> String {
     let mut v = n as f64;
-    for unit in ["bytes", "KB", "MB", "GB", "TB"] {
-        if v < 1024.0 || unit == "TB" {
-            return if unit == "bytes" { format!("{v:.0} {unit}") } else { format!("{v:.1} {unit}") };
+    for unit in ["bytes", "KB", "MB", "GB", "TB", "PB"] {
+        if v < base || unit == "PB" {
+            return if unit == "bytes" {
+                format!("{v:.0} {unit}")
+            } else if v < 10.0 {
+                format!("{v:.2} {unit}")
+            } else {
+                format!("{v:.1} {unit}")
+            };
         }
-        v /= 1024.0;
+        v /= base;
     }
     unreachable!()
+}
+
+/// The size unit people expect on this computer: Finder uses 1,000, Windows 1,024.
+pub fn default_size_base() -> u32 {
+    if cfg!(target_os = "windows") {
+        1024
+    } else {
+        1000
+    }
 }
 
 pub fn status_texts(param: &str) -> (String, String) {
@@ -288,6 +315,16 @@ fn matches_any(name: &str, pats: &[String]) -> bool {
     pats.iter().any(|p| wildcard(p, name))
 }
 
+/// Guess a field from a column header, when each row is a folder.
+pub fn auto_field_for(header: &str, folder_rows: bool) -> &'static str {
+    let f = auto_field(header);
+    if folder_rows && f == "parent" {
+        "name" // a "Folder" column means the row's own folder
+    } else {
+        f
+    }
+}
+
 /// Guess a field from a column header. "" means leave it alone.
 pub fn auto_field(header: &str) -> &'static str {
     let low = header.to_lowercase();
@@ -323,6 +360,24 @@ pub fn auto_field(header: &str) -> &'static str {
     if has(&["full path", "file path", "filepath", "location"]) || t == "path" {
         return "full_path";
     }
+    if w(&["size"]) || has(&["file size", "filesize"]) {
+        return if w(&["tb"]) {
+            "size_tb"
+        } else if w(&["gb"]) {
+            "size_gb"
+        } else if w(&["mb"]) {
+            "size_mb"
+        } else if w(&["kb"]) {
+            "size_kb"
+        } else if w(&["bytes", "byte", "b"]) {
+            "size_b"
+        } else {
+            "size_h"
+        };
+    }
+    if has(&["file count", "number of files", "no of files", "num files", "files count"]) || t == "count" || t == "# files" {
+        return "count";
+    }
     if has(&["folder", "directory"]) {
         return "parent";
     }
@@ -331,18 +386,6 @@ pub fn auto_field(header: &str) -> &'static str {
     }
     if has(&["file type", "filetype", "format"]) || t == "type" {
         return "ext_upper";
-    }
-    if w(&["size"]) {
-        if w(&["mb"]) {
-            return "size_mb";
-        }
-        if w(&["kb"]) {
-            return "size_kb";
-        }
-        if w(&["bytes", "byte", "b"]) {
-            return "size_b";
-        }
-        return "size_h";
     }
     if has(&["created", "creation"]) {
         return "created_d";
@@ -373,9 +416,15 @@ pub struct FileInfo {
     pub rel: String,
     pub rel_folder: String,
     pub folders: Vec<String>,
+    /// bytes; for a folder (or a Mac package) the total of everything inside
     pub size: u64,
+    /// newest modification inside, for folders
     pub mtime: NaiveDateTime,
     pub ctime: Option<NaiveDateTime>,
+    /// this row is a folder (folder rows mode)
+    pub is_folder: bool,
+    /// number of files: 1 for a file, everything inside for a folder or package
+    pub count: u64,
 }
 
 const JUNK: &[&str] = &[".ds_store", "thumbs.db", "desktop.ini", "icon\r", ".localized"];
@@ -414,11 +463,67 @@ fn is_hidden(path: &Path, md: &fs::Metadata) -> bool {
     false
 }
 
+/// What each grid row stands for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowMode {
+    Files,
+    /// folders at this depth (1 = folders directly inside the scanned folder),
+    /// each with the total size of everything inside
+    FolderLevel(u32),
+    /// every folder that holds files, with the size of its own files
+    FoldersWithFiles,
+}
+
+impl RowMode {
+    pub fn from_settings(mode: &str, level: u32) -> Self {
+        match mode {
+            "level" => RowMode::FolderLevel(level.max(1)),
+            "withfiles" => RowMode::FoldersWithFiles,
+            _ => RowMode::Files,
+        }
+    }
+}
+
 pub struct ScanOptions {
     pub recursive: bool,
     pub skip_hidden: bool,
     pub extensions: Vec<String>,
     pub exclude: Vec<String>,
+}
+
+/// Folders that Finder shows as single files (apps, Final Cut / Photos /
+/// Logic libraries…). They're measured as one item instead of opened up.
+const PACKAGES: &[&str] = &[
+    "app", "bundle", "framework", "plugin", "kext", "fcpbundle", "fcpxmld", "photoslibrary", "photolibrary", "aplibrary",
+    "imovielibrary", "theater", "tvlibrary", "musiclibrary", "logicx", "band", "rtfd", "pages", "numbers", "key",
+    "sparsebundle", "xcodeproj", "xcworkspace", "playground", "lrdata", "lrlibrary", "dvdmedia", "prproj-bundle",
+    "motn", "moef", "moti", "motr", "mpkg", "workflow", "scptd", "nib", "storyboardc", "xcarchive", "scnassets",
+];
+
+pub fn is_package(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .map(|e| PACKAGES.contains(&e.to_string_lossy().to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Total size, file count and newest change of everything inside a folder.
+fn measure_dir(dir: &Path) -> (u64, u64, Option<NaiveDateTime>) {
+    let (mut size, mut count, mut newest) = (0u64, 0u64, None::<NaiveDateTime>);
+    for e in walkdir::WalkDir::new(dir).follow_links(false).into_iter().flatten() {
+        if e.file_type().is_dir() {
+            continue;
+        }
+        if let Ok(md) = e.metadata() {
+            size += md.len();
+            count += 1;
+            if let Ok(m) = md.modified() {
+                let m = local(m);
+                newest = Some(newest.map_or(m, |n| n.max(m)));
+            }
+        }
+    }
+    (size, count, newest)
 }
 
 pub fn scan_folder(
@@ -437,7 +542,7 @@ pub fn scan_folder(
     let skip: HashSet<PathBuf> = skip.iter().filter_map(|p| p.canonicalize().ok()).collect();
     let root_name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
-    let walker = walkdir::WalkDir::new(root)
+    let mut it = walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(if o.recursive { usize::MAX } else { 1 })
         .sort_by(|a, b| {
@@ -464,11 +569,21 @@ pub fn scan_folder(
         });
 
     let mut out = Vec::new();
-    for e in walker.flatten() {
-        if !e.file_type().is_file() {
+    loop {
+        let e = match it.next() {
+            None => break,
+            Some(Ok(e)) => e,
+            Some(Err(_)) => continue, // a folder we aren't allowed to open
+        };
+        let name = e.file_name().to_string_lossy().to_string();
+        let ft = e.file_type();
+        let package = ft.is_dir() && e.depth() > 0 && is_package(&name);
+        if ft.is_dir() && !package {
             continue;
         }
-        let name = e.file_name().to_string_lossy().to_string();
+        if package {
+            it.skip_current_dir(); // measured as a whole below
+        }
         let low = name.to_lowercase();
         if JUNK.contains(&low.as_str()) || name.starts_with("~$") || name.starts_with("._") {
             continue;
@@ -481,7 +596,14 @@ pub fn scan_folder(
         if !exts.is_empty() && !exts.contains(&ext) {
             continue;
         }
-        let Ok(md) = e.metadata() else { continue };
+        // shortcuts (symlinks) to files are measured by what they point to
+        let md = match fs::metadata(p).or_else(|_| fs::symlink_metadata(p)) {
+            Ok(md) => md,
+            Err(_) => continue,
+        };
+        if md.is_dir() && !package {
+            continue; // a shortcut to a folder
+        }
         if o.skip_hidden && is_hidden(p, &md) {
             continue;
         }
@@ -489,10 +611,12 @@ pub fn scan_folder(
         if skip.contains(&full) {
             continue;
         }
+        let (size, count, newest) = if package { measure_dir(p) } else { (md.len(), 1, None) };
         let rel = p.strip_prefix(root).unwrap_or(p);
         let parent = rel.parent().unwrap_or(Path::new(""));
         let mut folders = vec![root_name.clone()];
         folders.extend(parent.components().map(|c| c.as_os_str().to_string_lossy().to_string()));
+        let mtime = md.modified().map(local).unwrap_or_default();
         out.push(FileInfo {
             stem: p.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default(),
             name,
@@ -500,16 +624,72 @@ pub fn scan_folder(
             rel: rel.display().to_string(),
             rel_folder: parent.display().to_string(),
             folders,
-            size: md.len(),
-            mtime: md.modified().map(local).unwrap_or_default(),
+            size,
+            mtime: newest.map_or(mtime, |n| n.max(mtime)),
             ctime: md.created().ok().map(local),
             path: strip_unc(full),
+            is_folder: false,
+            count,
         });
         if out.len() % 500 == 0 {
             progress(format!("Scanning… {} files found", out.len()));
         }
     }
     out
+}
+
+/// Turn a list of files into one row per folder, adding up sizes.
+pub fn folder_rows(root: &Path, files: &[FileInfo], mode: RowMode) -> Vec<FileInfo> {
+    use std::collections::BTreeMap;
+    let root_name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // key: folder path inside the scanned folder (lower case, for ordering)
+    let mut groups: BTreeMap<Vec<String>, (Vec<String>, u64, u64, NaiveDateTime)> = BTreeMap::new();
+    for f in files {
+        let inner = &f.folders[1..];
+        let key: Vec<String> = match mode {
+            RowMode::FolderLevel(n) => {
+                let n = n as usize;
+                if inner.len() < n {
+                    continue; // files that sit above that level
+                }
+                inner[..n].to_vec()
+            }
+            RowMode::FoldersWithFiles => inner.to_vec(),
+            RowMode::Files => return files.to_vec(),
+        };
+        let lower: Vec<String> = key.iter().map(|k| k.to_lowercase()).collect();
+        let g = groups.entry(lower).or_insert_with(|| (key, 0, 0, f.mtime));
+        g.1 += f.size;
+        g.2 += f.count;
+        g.3 = g.3.max(f.mtime);
+    }
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    groups
+        .into_values()
+        .map(|(key, size, count, newest)| {
+            let path = key.iter().fold(root.to_path_buf(), |p, k| p.join(k));
+            let created = fs::metadata(&path).ok().and_then(|m| m.created().ok()).map(local);
+            let name = key.last().cloned().unwrap_or_else(|| root_name.clone());
+            let mut folders = vec![root_name.clone()];
+            if !key.is_empty() {
+                folders.extend(key[..key.len() - 1].iter().cloned());
+            }
+            FileInfo {
+                path: strip_unc(path.canonicalize().unwrap_or(path)),
+                stem: name.clone(),
+                name,
+                ext: String::new(),
+                rel: key.join(sep),
+                rel_folder: if key.is_empty() { String::new() } else { key[..key.len() - 1].join(sep) },
+                folders,
+                size,
+                mtime: newest,
+                ctime: created,
+                is_folder: true,
+                count,
+            }
+        })
+        .collect()
 }
 
 /// Windows canonicalize() returns \\?\C:\... — turn it back into a normal path.
@@ -538,6 +718,13 @@ pub enum Val {
 pub struct Ctx {
     pub delimiter: String,
     pub today: NaiveDate,
+    /// 1000 (like Finder) or 1024 (like Windows)
+    pub base: f64,
+}
+
+fn round_to(v: f64, places: i32) -> f64 {
+    let m = 10f64.powi(places);
+    (v * m).round() / m
 }
 
 pub fn field_value(f: &str, param: &str, info: &FileInfo, ctx: &Ctx) -> Val {
@@ -570,10 +757,13 @@ pub fn field_value(f: &str, param: &str, info: &FileInfo, ctx: &Ctx) -> Val {
                 .unwrap_or_else(|_| info.path.display().to_string()),
             path: info.path.display().to_string(),
         },
-        "size_h" => t(&human_size(info.size)),
-        "size_kb" => Val::Num((info.size as f64 / 1024.0 * 10.0).round() / 10.0),
-        "size_mb" => Val::Num((info.size as f64 / 1048576.0 * 100.0).round() / 100.0),
+        "size_h" => t(&human_size(info.size, ctx.base)),
+        "size_kb" => Val::Num(round_to(info.size as f64 / ctx.base, 1)),
+        "size_mb" => Val::Num(round_to(info.size as f64 / ctx.base.powi(2), 2)),
+        "size_gb" => Val::Num(round_to(info.size as f64 / ctx.base.powi(3), 3)),
+        "size_tb" => Val::Num(round_to(info.size as f64 / ctx.base.powi(4), 4)),
         "size_b" => Val::Num(info.size as f64),
+        "count" => Val::Num(info.count as f64),
         "modified" => Val::DateTime(info.mtime),
         "modified_d" => Val::Date(info.mtime.date()),
         "created" => info.ctime.map(Val::DateTime).unwrap_or(Val::Text(String::new())),
@@ -933,6 +1123,8 @@ pub struct Job {
     pub update_existing: bool,
     pub backup: bool,
     pub only_new: bool,
+    pub row_mode: RowMode,
+    pub size_base: u32,
 }
 
 struct Prepared {
@@ -988,7 +1180,11 @@ fn prepare(j: &Job, progress: &dyn Fn(String)) -> Res<Prepared> {
 fn scan_for(j: &Job, progress: &dyn Fn(String)) -> Vec<FileInfo> {
     progress("Scanning folder…".into());
     let skip: Vec<PathBuf> = j.sheet_path.iter().cloned().collect();
-    scan_folder(&j.folder, &j.scan, &skip, progress)
+    let files = scan_folder(&j.folder, &j.scan, &skip, progress);
+    match j.row_mode {
+        RowMode::Files => files,
+        mode => folder_rows(&j.folder, &files, mode),
+    }
 }
 
 fn existing_rows(ws: &umya::Worksheet, hr: u32, last: u32, key_col: u32) -> HashMap<String, Vec<u32>> {
@@ -1121,7 +1317,7 @@ pub fn run_job(j: &Job, progress: &dyn Fn(String)) -> Res<RunResult> {
     }
     let mut existing = existing_rows(ws, hr, last, p.key.0);
     let mut indexer = Indexer::new(ws, hr, last, &p.plan);
-    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive() };
+    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 } };
     let (mut added, mut matched) = (0, 0);
     let (_kc, kf, kp) = p.key.clone();
 
@@ -1251,7 +1447,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         .map(|c| header_of.get(&c).map(|h| h.to_string()).unwrap_or_else(|| format!("(column {})", col_letter(c))))
         .collect();
     let fields: HashMap<u32, (&String, &String)> = p.plan.iter().map(|(c, f, prm)| (*c, (f, prm))).collect();
-    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive() };
+    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 } };
     let (_, kf, kp) = &p.key;
     let (mut rows, mut skipped) = (Vec::new(), 0);
     for info in &files {
@@ -1316,6 +1512,8 @@ mod tests {
             update_existing: true,
             backup: true,
             only_new: true,
+            row_mode: RowMode::Files,
+            size_base: 1024,
         }
     }
 
@@ -1411,6 +1609,59 @@ mod tests {
     }
 
     #[test]
+    fn folder_sizes_packages_and_shortcuts() {
+        let base = std::env::temp_dir().join(format!("ft-sizes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("Media");
+        let mk = |rel: &str, bytes: usize| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, vec![b'x'; bytes]).unwrap();
+        };
+        mk("Shot_010/plates/f_0001.exr", 1000);
+        mk("Shot_010/plates/f_0002.exr", 1000);
+        mk("Shot_010/notes.txt", 50);
+        mk("Shot_020/plates/f_0001.exr", 4000);
+        mk("Edit.fcpbundle/Media/clip.mov", 7000); // a Mac package
+        mk("Edit.fcpbundle/CurrentVersion.fcpevent", 300);
+        mk("readme.txt", 10);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("Shot_020/plates/f_0001.exr"), root.join("link.exr")).unwrap();
+
+        let o = ScanOptions { recursive: true, skip_hidden: true, extensions: vec![], exclude: vec![] };
+        let files = scan_folder(&root, &o, &[], &|_| {});
+        let by = |n: &str| files.iter().find(|f| f.name == n).map(|f| (f.size, f.count));
+        // the package is one item with the total of everything inside, not opened up
+        assert_eq!(by("Edit.fcpbundle"), Some((7300, 2)));
+        assert!(by("clip.mov").is_none());
+        #[cfg(unix)]
+        assert_eq!(by("link.exr"), Some((4000, 1)), "shortcuts are measured by what they point to");
+
+        let lvl = folder_rows(&root, &files, RowMode::FolderLevel(1));
+        let row = |rows: &[FileInfo], n: &str| rows.iter().find(|f| f.name == n).map(|f| (f.size, f.count, f.is_folder));
+        assert_eq!(row(&lvl, "Shot_010"), Some((2050, 3, true)));
+        assert_eq!(row(&lvl, "Shot_020"), Some((4000, 1, true)));
+        assert_eq!(lvl.len(), 2, "files above level 1 (and packages) aren't folder rows: {:?}", lvl.iter().map(|f| &f.name).collect::<Vec<_>>());
+
+        let with = folder_rows(&root, &files, RowMode::FoldersWithFiles);
+        let names: Vec<&str> = with.iter().map(|f| f.rel.as_str()).collect();
+        assert!(names.contains(&"Shot_010") && names.contains(&"") , "{names:?}");
+        let plates = with.iter().find(|f| f.rel == format!("Shot_010{}plates", std::path::MAIN_SEPARATOR)).unwrap();
+        assert_eq!((plates.size, plates.count, plates.name.as_str()), (2000, 2, "plates"));
+        assert_eq!(plates.folders, vec!["Media".to_string(), "Shot_010".to_string()]);
+
+        // GB / TB columns
+        let ctx = Ctx { delimiter: "_".into(), today: Local::now().date_naive(), base: 1000.0 };
+        let mut big = lvl[0].clone();
+        big.size = 2_345_000_000_000;
+        assert!(matches!(field_value("size_tb", "", &big, &ctx), Val::Num(v) if v == 2.345));
+        assert!(matches!(field_value("size_gb", "", &big, &ctx), Val::Num(v) if v == 2345.0));
+        assert!(matches!(field_value("size_h", "", &big, &ctx), Val::Text(t) if t == "2.35 TB"));
+        assert!(matches!(field_value("count", "", &lvl[0], &ctx), Val::Num(v) if v == 3.0));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn helpers() {
         assert!(wildcard("old*", "Old drawings"));
         assert!(wildcard("*.tmp", "a.TMP"));
@@ -1419,6 +1670,16 @@ mod tests {
         assert_eq!(parse_range("A3:J11"), Some(((1, 3), (10, 11))));
         assert_eq!(auto_field("Date Modified"), "modified_d");
         assert_eq!(auto_field("Reviewer Notes"), "");
-        assert_eq!(human_size(2_500_000), "2.4 MB");
+        assert_eq!(human_size(2_500_000, 1024.0), "2.38 MB");
+        assert_eq!(human_size(2_500_000, 1000.0), "2.50 MB");
+        assert_eq!(human_size(3_200_000_000_000, 1000.0), "3.20 TB");
+        assert_eq!(human_size(512, 1000.0), "512 bytes");
+        assert_eq!(auto_field("Folder Size"), "size_h");
+        assert_eq!(auto_field("Size (GB)"), "size_gb");
+        assert_eq!(auto_field("Size TB"), "size_tb");
+        assert_eq!(auto_field("File count"), "count");
+        assert_eq!(auto_field("Folder"), "parent");
+        assert_eq!(auto_field_for("Folder", true), "name");
+        assert_eq!(auto_field_for("Folder Size", true), "size_h");
     }
 }

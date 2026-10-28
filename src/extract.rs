@@ -368,6 +368,8 @@ mod tests {
             size: 1,
             mtime: Default::default(),
             ctime: None,
+            is_folder: false,
+            count: 1,
         }
     }
 

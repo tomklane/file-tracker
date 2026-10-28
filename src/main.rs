@@ -163,6 +163,8 @@ struct App {
     edit_sample: usize,
     upd: Upd,
     upd_rx: Option<mpsc::Receiver<UpdMsg>>,
+    /// row mode seen last frame, to re-guess untouched columns when it changes
+    last_row_mode: String,
 }
 
 fn alert(text: &str) {
@@ -248,9 +250,11 @@ impl App {
             edit_sample: 0,
             upd: Upd::Idle,
             upd_rx: None,
+            last_row_mode: String::new(),
         };
         update::cleanup_after_update();
         app.apply_sheet_mode(true);
+        app.last_row_mode = app.s.row_mode.clone();
         if app.s.check_updates {
             app.check_for_updates(false);
         }
@@ -272,7 +276,7 @@ impl App {
                 let (field, param) = match self.s.mapping.get(&header) {
                     Some((f, p)) if FIELDS.iter().any(|d| d.key == f) => (f.clone(), p.clone()),
                     _ => {
-                        let f = auto_field(&header);
+                        let f = auto_field_for(&header, self.s.row_mode != "files");
                         (f.to_string(), field(f).default.unwrap_or("").to_string())
                     }
                 };
@@ -385,6 +389,8 @@ impl App {
             update_existing: self.s.update_existing,
             backup: self.s.backup,
             only_new: self.s.only_new,
+            row_mode: RowMode::from_settings(&self.s.row_mode, self.s.folder_level),
+            size_base: self.s.size_base,
         }
     }
 
@@ -395,6 +401,7 @@ impl App {
             "{:?}",
             (
                 (s.folder.trim(), s.recursive, s.skip_hidden, &s.extensions, &s.exclude),
+                (&s.row_mode, s.folder_level, s.size_base),
                 (&s.sheet_mode, s.sheet_path.trim(), &s.sheet_name, s.header_row),
                 (&s.key_header, &s.delimiter, s.only_new),
                 self.rows.iter().map(|r| (r.col, &r.header, &r.field, &r.param)).collect::<Vec<_>>(),
@@ -514,6 +521,28 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Switching between file rows and folder rows: columns the user hasn't
+    /// changed follow the new mode (e.g. "Folder" = the row's own folder).
+    fn follow_row_mode(&mut self) {
+        if self.s.row_mode == self.last_row_mode {
+            return;
+        }
+        let (was, now) = (self.last_row_mode != "files", self.s.row_mode != "files");
+        self.last_row_mode = self.s.row_mode.clone();
+        if was == now {
+            return;
+        }
+        for r in &mut self.rows {
+            if r.field == auto_field_for(&r.header, was) {
+                let f = auto_field_for(&r.header, now);
+                r.field = f.to_string();
+                r.param = field(f).default.unwrap_or("").to_string();
+            }
+        }
+        self.remember_mapping();
+        self.refresh_key();
     }
 
     /// Decide whether the grid needs refreshing this frame.
@@ -1032,6 +1061,25 @@ impl App {
                 ui.checkbox(&mut self.s.recursive, "Include subfolders");
                 ui.checkbox(&mut self.s.skip_hidden, "Skip hidden & system files");
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Each row is:");
+                ui.radio_value(&mut self.s.row_mode, "files".into(), "a file");
+                ui.radio_value(&mut self.s.row_mode, "level".into(), "a folder at level")
+                    .on_hover_text("One row per folder at this depth, with the total size of everything inside it");
+                ui.add_enabled(
+                    self.s.row_mode == "level",
+                    egui::DragValue::new(&mut self.s.folder_level).range(1..=20),
+                )
+                .on_hover_text("1 = the folders directly inside the folder you scan");
+                ui.radio_value(&mut self.s.row_mode, "withfiles".into(), "each folder with files in it")
+                    .on_hover_text("One row for every folder that holds files (e.g. image sequences), sized by its own files");
+            });
+            if self.s.row_mode != "files" {
+                ui.colored_label(
+                    HINT,
+                    "Folder sizes add up every file inside that passes the filters below. “Date modified” is the newest file inside.",
+                );
+            }
             egui::Grid::new("s1").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Only these types:");
                 ui.add(
@@ -1155,6 +1203,11 @@ impl App {
         Self::section(ui, "4   Options", |ui| {
             ui.checkbox(&mut self.s.only_new, "Grid lists only files not yet in the sheet");
             ui.checkbox(&mut self.s.auto_refresh, "Update the grid when files change");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Sizes:");
+                ui.radio_value(&mut self.s.size_base, 1000, "like Finder (1 KB = 1,000 bytes)");
+                ui.radio_value(&mut self.s.size_base, 1024, "like Windows (1 KB = 1,024 bytes)");
+            });
             ui.add_space(4.0);
             ui.label(RichText::new("When using “Update spreadsheet”:").color(HINT));
             ui.radio_value(&mut self.s.run_mode, "update".into(), "Add new files, keep existing rows");
@@ -1203,7 +1256,8 @@ impl App {
             let summary = match &self.grid.data {
                 Some(d) => {
                     let n = d.rows.len();
-                    let what = if d.from_sheet && self.s.only_new { "new file" } else { "file" };
+                    let noun = if self.s.row_mode == "files" { "file" } else { "folder" };
+                    let what = if d.from_sheet && self.s.only_new { format!("new {noun}") } else { noun.to_string() };
                     let mut t = format!("{n} {what}{}", if n == 1 { "" } else { "s" });
                     if d.skipped > 0 {
                         t += &format!("  ·  {} already in the sheet", d.skipped);
@@ -1668,6 +1722,7 @@ impl eframe::App for App {
             self.do_action(action);
         }
         self.update_watchers();
+        self.follow_row_mode();
         self.schedule_grid();
     }
 }
