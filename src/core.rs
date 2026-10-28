@@ -55,6 +55,7 @@ pub const FIELDS: &[FieldDef] = &[
     f!("index", "Running number / ID (new rows only)", "#", "e.g.  #  or  DOC-###"),
     f!("status", "Present / Missing", "Present|Missing", "found text | missing text"),
     f!("text", "Fixed text", "", "text to write"),
+    f!("extract", "Custom: pick part of a folder or file name…", "", "Click Edit to choose"),
 ];
 
 pub fn field(key: &str) -> &'static FieldDef {
@@ -353,6 +354,7 @@ pub fn auto_field(header: &str) -> &'static str {
 
 // ------------------------------------------------------------------ scanning
 
+#[derive(Clone)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub name: String,
@@ -569,6 +571,7 @@ pub fn field_value(f: &str, param: &str, info: &FileInfo, ctx: &Ctx) -> Val {
         "scanned" => Val::Date(ctx.today),
         "status" => Val::Text(status_texts(param).0),
         "text" => t(param),
+        "extract" => Val::Text(crate::extract::apply(&crate::extract::parse(param), info).text),
         _ => t(""),
     }
 }
@@ -1188,6 +1191,8 @@ pub struct Preview {
     pub filled: Vec<bool>,
     /// the spreadsheet row the first grid row lands on when pasted
     pub start_row: u32,
+    /// a spread of scanned files, used as examples in the column builder
+    pub samples: Vec<FileInfo>,
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1230,6 +1235,10 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         letters: (lo..=hi).map(col_letter).collect(),
         filled: (lo..=hi).map(|c| fields.contains_key(&c)).collect(),
         start_row: last + 1,
+        samples: {
+            let step = (files.len() / 60).max(1);
+            files.iter().step_by(step).take(60).cloned().collect()
+        },
         columns,
         rows,
         files: files.len(),

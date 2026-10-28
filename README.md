@@ -35,11 +35,10 @@ folder.
 2. **Tracking spreadsheet.** Choose your existing tracker. The app finds the
    header row itself, even below a title, and you can change it. Or choose
    **Start from new columns** and type the column names you want.
-3. **What goes in each column.** Choose from: file name, part of the file
-   name (`PRJ001_Beam-Layout_RevA` gives part 1 = `PRJ001` and
-   part -1 = `RevA`), folder at a level, path, clickable link, size, dates,
-   a running ID (`DOC-###`), Present/Missing, or fixed text. Columns left on
-   **leave as is** stay blank in the grid and are never touched in your sheet.
+3. **What goes in each column.** Choose from: file name, folder, path,
+   clickable link, size, dates, a running ID (`DOC-###`), Present/Missing,
+   fixed text, or **Custom** (below). Columns left on **leave as is** stay
+   blank in the grid and are never touched in your sheet.
 4. **Copy from the grid.** The grid shows your sheet's column letters and
    the actual row numbers the files will land on. By default it lists only
    files that aren't in your sheet yet.
@@ -50,6 +49,38 @@ folder.
    - The app tells you which cell to click in your sheet (e.g. "Paste at
      cell A12"). Click it and paste.
    - Tick **Include header row** to copy the column names too.
+
+### Custom columns: any piece of a folder or file name
+
+Choose **Custom: pick part of a folder or file name…** for a column (or
+double-click its heading in the grid). A window opens with a real file from
+your folder:
+
+1. **Click where the text comes from.** This can be any folder in the path
+   or the file name. Folders can be counted from the top (e.g. the job
+   folder) or up from the file (e.g. the folder the file is in), which works
+   when folders are nested to different depths.
+2. **Choose what to keep:**
+   - **A section between separators.** Tick the separators (`_`, `-`,
+     space, `.`, or your own) and click the section you want. Shift-click
+     takes several sections, and "to the end" takes everything after it.
+     "Count from the end" handles names with different numbers of sections.
+     Sections can be any length.
+   - **Characters by position.** For example, the first 7 characters of
+     `2026-03 Smith House` gives `2026-03`. A negative start counts from the
+     end.
+   - **Text between markers.** For example, after `Rev` and before `_`.
+   - **Pattern.** A regular expression, for anything else.
+3. **Tidy up.** Trim spaces, change case, or set text to use when nothing is
+   found.
+
+The result is shown highlighted, along with what the same rule gives for
+other files in your folder, so you can check it before using it. The grid
+updates as you go.
+
+For example, with folders like `2026-03 Smith House` and
+`2026-11 Big Client Holdings Ltd`, "section 2 to the end, split at space"
+gives `Smith House` and `Big Client Holdings Ltd`.
 
 **Update spreadsheet** writes straight into the file instead. New files are
 added at the bottom and existing rows are refreshed. Deleted files are
@@ -98,6 +129,8 @@ You need [Rust](https://rustup.rs).
 |---|---|
 | `src/main.rs` | The app window (built with [egui](https://github.com/emilk/egui)) |
 | `src/core.rs` | Folder scanning, column values, spreadsheet reading and writing, tests |
+| `src/extract.rs` | Custom column rules (pieces of folder and file names), tests |
+| `src/builder.rs` | The column builder window |
 | `.github/workflows/build.yml` | Builds the Mac and Windows apps and publishes releases |
 | `python/` | The original Python version (needs Python 3; see `python/README.txt`) |
 | `tests/make_fixture.py` | Creates a sample folder and spreadsheets for the tests |

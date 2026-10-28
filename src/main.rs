@@ -3,7 +3,9 @@
 // Native GUI for macOS and Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
 
+mod builder;
 mod core;
+mod extract;
 
 use crate::core::*;
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, StrokeKind};
@@ -133,6 +135,9 @@ struct App {
     watch_key: String,
     files_changed: Arc<AtomicBool>,
     ctx: egui::Context,
+    /// the column open in the column builder window (index into `rows`)
+    editing: Option<usize>,
+    edit_sample: usize,
 }
 
 fn alert(text: &str) {
@@ -209,6 +214,8 @@ impl App {
             watch_key: String::new(),
             files_changed: Arc::new(AtomicBool::new(false)),
             ctx: cc.egui_ctx.clone(),
+            editing: None,
+            edit_sample: 0,
         };
         app.apply_sheet_mode(true);
         app
@@ -831,12 +838,17 @@ impl App {
         });
 
         Self::section(ui, "3   What goes in each column", |ui| {
-            ui.colored_label(HINT, "“— leave as is —” columns stay blank in the grid and are never changed in your sheet.");
+            ui.colored_label(
+                HINT,
+                "Pick “Custom…” to take any piece of a folder or file name. You can also double-click a column heading in the grid. \
+                 “— leave as is —” columns stay blank and are never changed in your sheet.",
+            );
             ui.add_space(4.0);
             if self.rows.is_empty() {
                 ui.colored_label(HINT, "No columns yet — choose a spreadsheet above.");
             } else {
                 let mut changed = false;
+                let mut open_editor = None;
                 egui::Grid::new("map_grid").num_columns(3).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
                     for (i, r) in self.rows.iter_mut().enumerate() {
                         let mut head = r.header.clone();
@@ -844,22 +856,18 @@ impl App {
                             head = head.chars().take(17).collect::<String>() + "…";
                         }
                         ui.label(format!("{}  {}", col_letter(r.col), head)).on_hover_text(&r.header);
-                        let before = r.field.clone();
-                        egui::ComboBox::from_id_salt(("field", i))
-                            .width(200.0)
-                            .selected_text(field(&r.field).label)
-                            .show_ui(ui, |ui| {
-                                ui.set_min_width(250.0);
-                                for f in FIELDS {
-                                    ui.selectable_value(&mut r.field, f.key.to_string(), f.label);
-                                }
-                            });
-                        if r.field != before {
-                            r.param = field(&r.field).default.unwrap_or("").to_string();
+                        if builder::field_combo(ui, ("field", i), 200.0, &mut r.field, &mut r.param) {
                             changed = true;
+                            if r.field == "extract" {
+                                open_editor = Some(i);
+                            }
                         }
                         let def = field(&r.field);
-                        if def.default.is_some() {
+                        if r.field == "extract" {
+                            if ui.button("Edit…").on_hover_text("Choose which piece of the folder or file name goes here").clicked() {
+                                open_editor = Some(i);
+                            }
+                        } else if def.default.is_some() {
                             ui.add(egui::TextEdit::singleline(&mut r.param).desired_width(70.0)).on_hover_text(def.hint);
                         } else {
                             ui.label("");
@@ -867,6 +875,9 @@ impl App {
                         ui.end_row();
                     }
                 });
+                if open_editor.is_some() {
+                    self.editing = open_editor;
+                }
                 if changed {
                     self.remember_mapping();
                     self.refresh_key();
@@ -1040,7 +1051,17 @@ impl App {
         let blank_fill = visuals.extreme_bg_color.gamma_multiply(0.6);
         let line = Stroke::new(0.5, visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.8));
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
-        let table_key = d.columns.join("\u{1f}");
+        // column widths follow the content; when a column's content changes size
+        // noticeably (e.g. it was empty and is now filled) the table re-lays out
+        let widths: Vec<f32> = (0..ncols)
+            .map(|c| {
+                let longest = d.rows.iter().take(300).map(|r| r[c].0.chars().count()).max().unwrap_or(0);
+                let chars = longest.max(d.columns[c].chars().count()).max(4);
+                (chars as f32 * 7.2 + 20.0).clamp(56.0, 380.0)
+            })
+            .collect();
+        let buckets: Vec<i32> = widths.iter().map(|w| (w / 40.0).round() as i32).collect();
+        let table_key = format!("{}|{:?}", d.columns.join("\u{1f}"), buckets);
 
         let paint_cell = |ui: &mut egui::Ui, fill: Option<Color32>| {
             let r = ui.max_rect();
@@ -1064,10 +1085,8 @@ impl App {
                     .auto_shrink([false, false])
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .column(Column::exact(GUTTER_W));
-                for c in 0..ncols {
-                    let longest = d.rows.iter().take(300).map(|r| r[c].0.chars().count()).max().unwrap_or(0);
-                    let chars = longest.max(d.columns[c].chars().count()).max(4);
-                    tb = tb.column(Column::initial((chars as f32 * 7.2 + 20.0).clamp(56.0, 380.0)).at_least(36.0).clip(true));
+                for w in &widths {
+                    tb = tb.column(Column::initial(*w).at_least(36.0).clip(true));
                 }
                 tb.header(42.0, |mut h| {
                     h.col(|ui| {
@@ -1086,9 +1105,11 @@ impl App {
                                 let name = RichText::new(&d.columns[c]).strong();
                                 let name = if d.filled[c] { name } else { name.italics().color(HINT) };
                                 let resp = ui.add(egui::Label::new(name).truncate().selectable(false));
-                                if !d.filled[c] {
-                                    resp.on_hover_text("Left as is — this column pastes as blank so the others line up.");
-                                }
+                                resp.on_hover_text(if d.filled[c] {
+                                    "Click to select this column. Double-click to choose what goes in it."
+                                } else {
+                                    "Left as is — pastes as blank so the other columns line up. Double-click to fill it."
+                                });
                             });
                         });
                     }
@@ -1127,6 +1148,44 @@ impl App {
         self.grid_mouse(ui.ctx(), nrows, ncols);
     }
 
+    /// Double-clicking a grid heading opens that column in the builder.
+    fn open_column_from_grid(&mut self, c: usize) {
+        let Some(letter) = self.grid.data.as_ref().and_then(|d| d.letters.get(c).cloned()) else { return };
+        if let Some(i) = self.rows.iter().position(|r| col_letter(r.col) == letter) {
+            self.editing = Some(i);
+            self.grid.drag = None;
+        }
+    }
+
+    fn column_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editing else { return };
+        if i >= self.rows.len() {
+            self.editing = None;
+            return;
+        }
+        let samples: &[FileInfo] = self.grid.data.as_ref().map(|d| d.samples.as_slice()).unwrap_or(&[]);
+        let row = &mut self.rows[i];
+        let before = (row.field.clone(), row.param.clone());
+        let open = builder::column_window(
+            ctx,
+            &col_letter(row.col),
+            &row.header,
+            &mut row.field,
+            &mut row.param,
+            samples,
+            &mut self.edit_sample,
+        );
+        let changed = (row.field.as_str(), row.param.as_str()) != (before.0.as_str(), before.1.as_str());
+        if changed {
+            self.remember_mapping();
+            self.refresh_key();
+            ctx.request_repaint(); // show the new layout straight away
+        }
+        if !open {
+            self.editing = None;
+        }
+    }
+
     fn hit_at(&self, pos: Pos2) -> Option<Hit> {
         self.grid.hits.iter().find(|(r, _)| r.contains(pos)).map(|(_, h)| *h)
     }
@@ -1146,6 +1205,7 @@ impl App {
             (press, i.pointer.primary_down(), i.pointer.latest_pos(), i.modifiers.shift)
         });
         let pressed = press_pos.is_some();
+        let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let shift = press_pos.map(|(_, s)| s || shift).unwrap_or(shift);
         let press_pos = press_pos.map(|(p, _)| p);
         let on_grid_layer =
@@ -1175,6 +1235,9 @@ impl App {
                     };
                     self.grid.sel = Some(sel);
                     self.grid.drag = if hit == Hit::Corner { None } else { Some(drag) };
+                    if let (true, Hit::Col(c)) = (double, hit) {
+                        self.open_column_from_grid(c);
+                    }
                 }
             }
         }
@@ -1277,6 +1340,7 @@ impl eframe::App for App {
             self.grid_view(ui);
         });
 
+        self.column_window(&ctx);
         self.grid_keys(&ctx);
         if action != Action::None {
             self.do_action(action);
