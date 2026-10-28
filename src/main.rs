@@ -6,6 +6,8 @@
 mod builder;
 mod core;
 mod extract;
+mod sorting;
+mod update;
 
 use crate::core::*;
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, StrokeKind};
@@ -49,9 +51,28 @@ enum Msg {
     Error(String),
 }
 
+/// Where an in-app update is up to.
+enum Upd {
+    Idle,
+    Checking { manual: bool },
+    UpToDate,
+    Available(update::Release),
+    Downloading { rel: update::Release, got: u64, total: u64 },
+    Installing,
+    Failed { msg: String, rel: Option<update::Release> },
+}
+
+enum UpdMsg {
+    Checked(Result<update::Release, String>, bool),
+    Progress(u64, u64),
+    Installed(Result<PathBuf, String>),
+}
+
 /// What the mouse is over in the grid.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
+    /// the sort arrow in a column heading
+    Sort(usize),
     Cell(usize, usize),
     Row(usize),
     Col(usize),
@@ -121,6 +142,8 @@ struct Grid {
     copy_msg: String,
     /// visible on-screen areas of grid cells this frame, for mouse hit-testing
     hits: Vec<(Rect, Hit)>,
+    /// display order of the rows (indexes into data.rows), after sorting
+    order: Vec<usize>,
 }
 
 struct App {
@@ -138,6 +161,8 @@ struct App {
     /// the column open in the column builder window (index into `rows`)
     editing: Option<usize>,
     edit_sample: usize,
+    upd: Upd,
+    upd_rx: Option<mpsc::Receiver<UpdMsg>>,
 }
 
 fn alert(text: &str) {
@@ -153,6 +178,10 @@ fn ask(text: &str) -> bool {
         MessageDialog::new().set_title(APP_NAME).set_description(text).set_buttons(MessageButtons::YesNo).show(),
         MessageDialogResult::Yes
     )
+}
+
+fn open_url(url: &str) {
+    let _ = open::that_detached(url);
 }
 
 fn paste_keys() -> &'static str {
@@ -209,6 +238,7 @@ impl App {
                 drag: None,
                 copy_msg: String::new(),
                 hits: vec![],
+                order: vec![],
             },
             watchers: vec![],
             watch_key: String::new(),
@@ -216,8 +246,14 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             editing: None,
             edit_sample: 0,
+            upd: Upd::Idle,
+            upd_rx: None,
         };
+        update::cleanup_after_update();
         app.apply_sheet_mode(true);
+        if app.s.check_updates {
+            app.check_for_updates(false);
+        }
         app
     }
 
@@ -421,6 +457,7 @@ impl App {
                 }
                 g.message = None;
                 g.data = Some(p);
+                self.rebuild_order();
             }
             Err(e) => {
                 g.data = None;
@@ -503,6 +540,222 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ sorting
+
+    fn sort_index(&self) -> Option<usize> {
+        let d = self.grid.data.as_ref()?;
+        d.columns.iter().position(|h| !self.s.sort_col.is_empty() && *h == self.s.sort_col)
+    }
+
+    /// Renumber running-number columns when sorted by something else.
+    fn renumber(&self) -> bool {
+        match (self.sort_index(), &self.grid.data) {
+            (Some(c), Some(d)) => d.index_specs.get(c).map(|s| s.is_none()).unwrap_or(true),
+            _ => false,
+        }
+    }
+
+    fn rebuild_order(&mut self) {
+        let sc = self.sort_index();
+        self.grid.order = match &self.grid.data {
+            Some(d) => sorting::view_order(d, sc, self.s.sort_desc),
+            None => vec![],
+        };
+    }
+
+    /// Clicking a column's sort arrow: A→Z, then Z→A, then back to folder order.
+    fn toggle_sort(&mut self, c: usize) {
+        let Some(name) = self.grid.data.as_ref().and_then(|d| d.columns.get(c).cloned()) else { return };
+        if self.s.sort_col != name {
+            self.s.sort_col = name;
+            self.s.sort_desc = false;
+        } else if !self.s.sort_desc {
+            self.s.sort_desc = true;
+        } else {
+            self.s.sort_col.clear();
+            self.s.sort_desc = false;
+        }
+        self.grid.sel = None;
+        self.grid.copy_msg.clear();
+        self.rebuild_order();
+    }
+
+    // ------------------------------------------------------------ updates
+
+    fn check_for_updates(&mut self, manual: bool) {
+        if matches!(self.upd, Upd::Checking { .. } | Upd::Downloading { .. } | Upd::Installing) {
+            return;
+        }
+        self.upd = Upd::Checking { manual };
+        let (tx, rx) = mpsc::channel();
+        self.upd_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(UpdMsg::Checked(update::check_latest(), manual));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update(&mut self, rel: update::Release) {
+        self.remember_mapping();
+        save_settings(&self.s, &settings_file());
+        self.upd = Upd::Downloading { rel: rel.clone(), got: 0, total: rel.asset_size };
+        let (tx, rx) = mpsc::channel();
+        self.upd_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let report = |got: u64, total: u64| {
+                let _ = tx.send(UpdMsg::Progress(got, total));
+                ctx.request_repaint();
+            };
+            let res = update::download(&rel, &report).and_then(|file| update::install(&file));
+            let _ = tx.send(UpdMsg::Installed(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_updates(&mut self) {
+        let Some(rx) = &self.upd_rx else { return };
+        let mut done = false;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                UpdMsg::Checked(res, manual) => {
+                    done = true;
+                    self.upd = match res {
+                        Ok(rel) if update::is_newer(&rel.version, &update::current_version()) && (manual || rel.version != self.s.skip_version) => {
+                            Upd::Available(rel)
+                        }
+                        Ok(_) if manual => Upd::UpToDate,
+                        Err(e) if manual => Upd::Failed { msg: e, rel: None },
+                        _ => Upd::Idle,
+                    };
+                }
+                UpdMsg::Progress(got, total) => {
+                    if let Upd::Downloading { got: g, total: t, .. } = &mut self.upd {
+                        *g = got;
+                        *t = total;
+                        if got >= total && total > 0 {
+                            self.upd = Upd::Installing;
+                        }
+                    }
+                }
+                UpdMsg::Installed(res) => {
+                    done = true;
+                    match res {
+                        Ok(target) => {
+                            self.remember_mapping();
+                            save_settings(&self.s, &settings_file());
+                            update::relaunch(&target);
+                        }
+                        Err(msg) => {
+                            let rel = match std::mem::replace(&mut self.upd, Upd::Idle) {
+                                Upd::Downloading { rel, .. } | Upd::Available(rel) => Some(rel),
+                                _ => None,
+                            };
+                            self.upd = Upd::Failed { msg, rel };
+                        }
+                    }
+                }
+            }
+        }
+        if done {
+            self.upd_rx = None;
+        }
+    }
+
+    /// The bar across the top that offers and shows an update.
+    fn update_bar(&mut self, ui: &mut egui::Ui) {
+        let releases_page = format!("https://github.com/{}/releases/latest", update::REPO);
+        let mut next: Option<Upd> = None;
+        let mut start: Option<update::Release> = None;
+        let mut check = false;
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| match &self.upd {
+            Upd::Idle => {}
+            Upd::Checking { .. } => {
+                ui.spinner();
+                ui.label("Checking for updates…");
+            }
+            Upd::UpToDate => {
+                ui.label(format!("✔ You have the latest version ({}).", update::current_version()));
+                if ui.button("OK").clicked() {
+                    next = Some(Upd::Idle);
+                }
+            }
+            Upd::Available(rel) => {
+                ui.label(RichText::new(format!("File Tracker {} is available", rel.version)).strong());
+                ui.colored_label(HINT, format!("(you have {})", update::current_version()));
+                if update::can_self_update() && rel.asset_url.is_some() {
+                    if ui.add_enabled(!self.busy, egui::Button::new(RichText::new("Update now").strong())).clicked() {
+                        start = Some(rel.clone());
+                    }
+                } else if ui.button("Open download page").clicked() {
+                    open_url(&rel.page);
+                }
+                let notes: String = rel.notes.chars().take(700).collect();
+                let whats_new = ui.button("What's new");
+                let whats_new = if notes.trim().is_empty() { whats_new } else { whats_new.on_hover_text(notes) };
+                if whats_new.clicked() {
+                    open_url(&rel.page);
+                }
+                if ui.button("Skip this version").clicked() {
+                    self.s.skip_version = rel.version.clone();
+                    next = Some(Upd::Idle);
+                }
+                if ui.button("Later").clicked() {
+                    next = Some(Upd::Idle);
+                }
+            }
+            Upd::Downloading { rel, got, total } => {
+                ui.label(format!("Downloading File Tracker {}…", rel.version));
+                let frac = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(260.0)
+                        .text(format!("{:.1} of {:.1} MB", *got as f64 / 1e6, *total as f64 / 1e6)),
+                );
+            }
+            Upd::Installing => {
+                ui.spinner();
+                ui.label("Installing — File Tracker will restart in a moment…");
+            }
+            Upd::Failed { msg, rel } => {
+                ui.colored_label(Color32::from_rgb(220, 120, 80), format!("The update didn't finish: {msg}"));
+                if rel.is_some() && ui.button("Try again").clicked() {
+                    start = rel.clone();
+                }
+                if rel.is_none() && ui.button("Try again").clicked() {
+                    check = true;
+                }
+                if ui.button("Open download page").clicked() {
+                    open_url(&rel.as_ref().map(|r| r.page.clone()).unwrap_or_else(|| releases_page.clone()));
+                }
+                if ui.button("Close").clicked() {
+                    next = Some(Upd::Idle);
+                }
+            }
+        });
+        ui.add_space(4.0);
+        if let Some(n) = next {
+            self.upd = n;
+        }
+        if let Some(rel) = start {
+            self.start_update(rel);
+        }
+        if check {
+            self.upd = Upd::Idle;
+            self.check_for_updates(true);
+        }
+    }
+
+    fn show_update_bar(&self) -> bool {
+        match &self.upd {
+            Upd::Idle => false,
+            Upd::Checking { manual } => *manual,
+            _ => true,
+        }
+    }
+
     // ------------------------------------------------------------ copy
 
     fn copy_range(&mut self, r0: usize, r1: usize, c0: usize, c1: usize) {
@@ -511,8 +764,10 @@ impl App {
         if self.s.copy_headers {
             lines.push(d.columns[c0..=c1].join("\t"));
         }
-        for row in &d.rows[r0..=r1] {
-            lines.push(row[c0..=c1].iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\t"));
+        let renumber = self.renumber();
+        for r in r0..=r1 {
+            let cells: Vec<String> = (c0..=c1).map(|c| sorting::cell(d, &self.grid.order, renumber, r, c).1).collect();
+            lines.push(cells.join("\t"));
         }
         self.ctx.copy_text(lines.join("\n"));
         let (nr, nc) = (r1 - r0 + 1, c1 - c0 + 1);
@@ -926,6 +1181,15 @@ impl App {
             }
             ui.colored_label(HINT, self.status.as_str());
         });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(HINT, format!("File Tracker {}", update::current_version()));
+            if ui.small_button("Check for updates").clicked() {
+                self.check_for_updates(true);
+            }
+            ui.checkbox(&mut self.s.check_updates, "Check when the app starts");
+        });
         action
     }
 
@@ -950,6 +1214,16 @@ impl App {
             };
             let found = self.grid.data.as_ref().map(|d| d.files).unwrap_or(0);
             ui.label(summary).on_hover_text(format!("{found} files found in the folder"));
+            if let Some(c) = self.sort_index() {
+                let name = self.grid.data.as_ref().map(|d| d.columns[c].clone()).unwrap_or_default();
+                ui.colored_label(HINT, format!("·  sorted by {name} ({})", if self.s.sort_desc { "Z→A" } else { "A→Z" }));
+                if ui.small_button("Unsort").on_hover_text("Back to the order the files were found in").clicked() {
+                    self.s.sort_col.clear();
+                    self.s.sort_desc = false;
+                    self.grid.sel = None;
+                    self.rebuild_order();
+                }
+            }
             if self.grid.busy {
                 ui.spinner();
                 ui.colored_label(HINT, "updating…");
@@ -1044,6 +1318,10 @@ impl App {
         let nrows = d.rows.len();
         let ncols = d.columns.len();
         let sel = self.grid.sel;
+        let sort_c = self.sort_index();
+        let sort_desc = self.s.sort_desc;
+        let renumber = self.renumber();
+        let order = &self.grid.order;
         let visuals = ui.visuals().clone();
         let sel_fill = visuals.selection.bg_fill.gamma_multiply(0.45);
         let head_fill = visuals.faint_bg_color.gamma_multiply(1.6);
@@ -1056,8 +1334,9 @@ impl App {
         let widths: Vec<f32> = (0..ncols)
             .map(|c| {
                 let longest = d.rows.iter().take(300).map(|r| r[c].0.chars().count()).max().unwrap_or(0);
-                let chars = longest.max(d.columns[c].chars().count()).max(4);
-                (chars as f32 * 7.2 + 20.0).clamp(56.0, 380.0)
+                let content = longest.max(4) as f32 * 7.2 + 20.0;
+                let heading = d.columns[c].chars().count() as f32 * 7.8 + 44.0; // room for the sort arrows
+                content.max(heading).clamp(70.0, 380.0)
             })
             .collect();
         let buckets: Vec<i32> = widths.iter().map(|w| (w / 40.0).round() as i32).collect();
@@ -1097,16 +1376,27 @@ impl App {
                         h.col(|ui| {
                             let selected = sel.map(|s| s.has_col(c)).unwrap_or(false);
                             let r = paint_cell(ui, Some(if selected { head_sel_fill } else { head_fill }));
+                            // sort arrow on the right of the heading
+                            let full = ui.max_rect();
+                            let arrow = Rect::from_min_size(
+                                egui::pos2(full.right() - 22.0, full.center().y - 10.0),
+                                egui::vec2(18.0, 20.0),
+                            );
+                            let state = if sort_c == Some(c) { Some(sort_desc) } else { None };
+                            let hovered = ui.rect_contains_pointer(arrow.intersect(ui.clip_rect()));
+                            paint_sort_arrow(ui.painter(), arrow, state, hovered, &visuals);
+                            hits.push((arrow.intersect(ui.clip_rect()), Hit::Sort(c)));
                             hits.push((r, Hit::Col(c)));
                             ui.add_space(5.0);
                             ui.vertical(|ui| {
+                                ui.set_max_width((full.width() - 30.0).max(10.0));
                                 ui.add_space(3.0);
                                 ui.label(RichText::new(&d.letters[c]).small().color(HINT));
                                 let name = RichText::new(&d.columns[c]).strong();
                                 let name = if d.filled[c] { name } else { name.italics().color(HINT) };
                                 let resp = ui.add(egui::Label::new(name).truncate().selectable(false));
                                 resp.on_hover_text(if d.filled[c] {
-                                    "Click to select this column. Double-click to choose what goes in it."
+                                    "Click to select this column. Double-click to choose what goes in it. Click the arrows to sort."
                                 } else {
                                     "Left as is — pastes as blank so the other columns line up. Double-click to fill it."
                                 });
@@ -1126,7 +1416,8 @@ impl App {
                                 ui.label(RichText::new((d.start_row as usize + i).to_string()).small().color(HINT));
                             });
                         });
-                        for (c, (shown, _)) in d.rows[i].iter().enumerate() {
+                        for c in 0..ncols {
+                            let (shown, _) = sorting::cell(d, order, renumber, i, c);
                             row.col(|ui| {
                                 let fill = if sel.map(|s| s.contains(i, c)).unwrap_or(false) {
                                     Some(sel_fill)
@@ -1213,6 +1504,10 @@ impl App {
 
         if pressed {
             if let Some(p) = press_pos.filter(|p| on_grid_layer(*p)) {
+                if let Some(Hit::Sort(c)) = self.hit_at(p) {
+                    self.toggle_sort(c);
+                    return;
+                }
                 if let Some(hit) = self.hit_at(p) {
                     ctx.memory_mut(|m| m.stop_text_input());
                     self.grid.copy_msg.clear();
@@ -1231,7 +1526,7 @@ impl App {
                             (true, Some(s)) => (Sel { a: (0, s.a.1), b: (nrows - 1, c) }, DragKind::Col),
                             _ => (Sel { a: (0, c), b: (nrows - 1, c) }, DragKind::Col),
                         },
-                        Hit::Corner => (Sel { a: (0, 0), b: (nrows - 1, last_c) }, DragKind::Cell),
+                        Hit::Corner | Hit::Sort(_) => (Sel { a: (0, 0), b: (nrows - 1, last_c) }, DragKind::Cell),
                     };
                     self.grid.sel = Some(sel);
                     self.grid.drag = if hit == Hit::Corner { None } else { Some(drag) };
@@ -1248,7 +1543,7 @@ impl App {
                     Hit::Cell(r, c) => (Some(r), Some(c)),
                     Hit::Row(r) => (Some(r), None),
                     Hit::Col(c) => (None, Some(c)),
-                    Hit::Corner => (None, None),
+                    Hit::Corner | Hit::Sort(_) => (None, None),
                 };
                 match kind {
                     DragKind::Cell => sel.b = (r.unwrap_or(sel.b.0), c.unwrap_or(sel.b.1)),
@@ -1298,17 +1593,44 @@ impl App {
     }
 }
 
+/// Two small triangles; the active direction is drawn bright.
+fn paint_sort_arrow(p: &egui::Painter, r: Rect, state: Option<bool>, hovered: bool, v: &egui::Visuals) {
+    let dim = if hovered { v.text_color() } else { HINT.gamma_multiply(0.7) };
+    let on = v.strong_text_color();
+    let c = r.center();
+    let (w, h, gap) = (4.5, 4.0, 1.5);
+    let up = vec![egui::pos2(c.x - w, c.y - gap), egui::pos2(c.x + w, c.y - gap), egui::pos2(c.x, c.y - gap - h)];
+    let down = vec![egui::pos2(c.x - w, c.y + gap), egui::pos2(c.x + w, c.y + gap), egui::pos2(c.x, c.y + gap + h)];
+    let (up_col, down_col) = match state {
+        Some(false) => (on, Color32::TRANSPARENT),
+        Some(true) => (Color32::TRANSPARENT, on),
+        None => (dim, dim),
+    };
+    p.add(egui::Shape::convex_polygon(up, up_col, Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(down, down_col, Stroke::NONE));
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_update();
         self.poll_grid();
+        self.poll_updates();
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if ui.input(|i| i.viewport().close_requested()) {
             self.remember_mapping();
             save_settings(&self.s, &settings_file());
+        }
+
+        if self.show_update_bar() {
+            egui::Panel::top("update_bar")
+                .frame(egui::Frame::new().fill(ui.visuals().selection.bg_fill.gamma_multiply(0.35)).inner_margin(egui::Margin::symmetric(12, 2)))
+                .show(ui, |ui| self.update_bar(ui));
+        }
+        if matches!(self.upd, Upd::Downloading { .. } | Upd::Installing | Upd::Checking { .. }) {
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
 
         let mut action = Action::None;

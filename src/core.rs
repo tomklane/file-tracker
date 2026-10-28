@@ -102,6 +102,12 @@ pub struct Settings {
     pub only_new: bool,
     pub auto_refresh: bool,
     pub copy_headers: bool,
+    /// grid sort: column heading ("" = not sorted) and direction
+    pub sort_col: String,
+    pub sort_desc: bool,
+    pub check_updates: bool,
+    /// a release the user chose to skip
+    pub skip_version: String,
     /// header text -> [field key, setting]
     pub mapping: HashMap<String, (String, String)>,
 }
@@ -127,6 +133,10 @@ impl Default for Settings {
             only_new: true,
             auto_refresh: true,
             copy_headers: false,
+            sort_col: String::new(),
+            sort_desc: false,
+            check_updates: true,
+            skip_version: String::new(),
             mapping: HashMap::new(),
         }
     }
@@ -992,6 +1002,28 @@ fn existing_rows(ws: &umya::Worksheet, hr: u32, last: u32, key_col: u32) -> Hash
     m
 }
 
+/// How a running-number column is written, so the grid can renumber rows
+/// after sorting them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexSpec {
+    pub pre: String,
+    pub width: usize,
+    pub suf: String,
+    /// the number the first new row gets
+    pub first: i64,
+    pub plain: bool,
+}
+
+impl IndexSpec {
+    pub fn text(&self, n: i64) -> String {
+        if self.plain {
+            n.to_string()
+        } else {
+            format!("{}{:0w$}{}", self.pre, n, self.suf, w = self.width)
+        }
+    }
+}
+
 /// Running-number columns carry on from the highest number already in the sheet.
 struct Indexer {
     state: HashMap<u32, (String, usize, String, i64, bool)>,
@@ -1031,6 +1063,10 @@ impl Indexer {
         }
         Indexer { state }
     }
+    fn spec(&self, c: u32) -> Option<IndexSpec> {
+        self.state.get(&c).map(|s| IndexSpec { pre: s.0.clone(), width: s.1, suf: s.2.clone(), first: s.3 + 1, plain: s.4 })
+    }
+
     fn next(&mut self, c: u32) -> Val {
         let s = self.state.get_mut(&c).unwrap();
         s.3 += 1;
@@ -1193,6 +1229,8 @@ pub struct Preview {
     pub start_row: u32,
     /// a spread of scanned files, used as examples in the column builder
     pub samples: Vec<FileInfo>,
+    /// for running-number columns: how to renumber rows after sorting
+    pub index_specs: Vec<Option<IndexSpec>>,
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1207,6 +1245,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     let mut indexer = Indexer::new(ws, p.hr, last, &p.plan);
 
     let (lo, hi) = (*all_cols.iter().min().unwrap(), *all_cols.iter().max().unwrap());
+    let index_specs: Vec<Option<IndexSpec>> = (lo..=hi).map(|c| indexer.spec(c)).collect();
     let header_of: HashMap<u32, &String> = p.headers.iter().map(|(c, h)| (*c, h)).collect();
     let columns: Vec<String> = (lo..=hi)
         .map(|c| header_of.get(&c).map(|h| h.to_string()).unwrap_or_else(|| format!("(column {})", col_letter(c))))
@@ -1235,6 +1274,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         letters: (lo..=hi).map(col_letter).collect(),
         filled: (lo..=hi).map(|c| fields.contains_key(&c)).collect(),
         start_row: last + 1,
+        index_specs,
         samples: {
             let step = (files.len() / 60).max(1);
             files.iter().step_by(step).take(60).cloned().collect()

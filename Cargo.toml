@@ -1,6 +1,6 @@
 [package]
 name = "file_tracker"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "Scan a folder and fill a tracking spreadsheet, or copy the list into any spreadsheet."
 
@@ -20,6 +20,9 @@ open = "5"
 dirs = "6"
 regex = "1"
 notify = "8"
+ureq = { version = "3", features = ["platform-verifier", "win-system-proxy"] }
+self-replace = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3

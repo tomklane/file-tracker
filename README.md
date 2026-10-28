@@ -19,6 +19,14 @@ Go to **[Releases](../../releases/latest)** and download:
 | Mac (Apple Silicon or Intel) | `File-Tracker-Mac.zip`. Unzip it and drag **File Tracker** to Applications. |
 | Windows | `File-Tracker-Windows.exe`. It's a single file with nothing to install. |
 
+**Updates.** From version 1.3.0, File Tracker checks for new versions when it
+starts. When one is available, a bar appears at the top: click **Update now**
+and it downloads the new version, swaps it in and restarts. You can also click
+**Check for updates** at the bottom of the settings, or turn the automatic
+check off there. If File Tracker isn't allowed to change the folder it's in
+(for example, an admin-only Applications folder), it offers the download
+page instead.
+
 **First launch.** The apps aren't signed by Apple or Microsoft, so:
 - **Mac:** open the app once. When macOS blocks it, go to **System Settings ›
   Privacy & Security**, scroll down and click **Open Anyway**.
@@ -49,6 +57,12 @@ folder.
    - The app tells you which cell to click in your sheet (e.g. "Paste at
      cell A12"). Click it and paste.
    - Tick **Include header row** to copy the column names too.
+   - **Sort** by any column with the small arrows on its heading: click once
+     for A→Z, again for Z→A, and a third time to go back to the order the
+     files were found in. Numbers inside text sort properly (`Rev2` before
+     `Rev10`), and empty cells always go last. Running numbers (`DOC-###`)
+     renumber to follow the sorted order, so what you paste stays in
+     sequence. The sort is remembered between runs.
 
 ### Custom columns: any piece of a folder or file name
 
@@ -131,6 +145,8 @@ You need [Rust](https://rustup.rs).
 | `src/core.rs` | Folder scanning, column values, spreadsheet reading and writing, tests |
 | `src/extract.rs` | Custom column rules (pieces of folder and file names), tests |
 | `src/builder.rs` | The column builder window |
+| `src/sorting.rs` | Sorting the grid (natural order, renumbering) |
+| `src/update.rs` | In-app updates from the Releases page |
 | `.github/workflows/build.yml` | Builds the Mac and Windows apps and publishes releases |
 | `python/` | The original Python version (needs Python 3; see `python/README.txt`) |
 | `tests/make_fixture.py` | Creates a sample folder and spreadsheets for the tests |
