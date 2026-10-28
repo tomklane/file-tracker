@@ -99,6 +99,8 @@ pub struct Settings {
     pub update_existing: bool,
     pub backup: bool,
     pub only_new: bool,
+    pub auto_refresh: bool,
+    pub copy_headers: bool,
     /// header text -> [field key, setting]
     pub mapping: HashMap<String, (String, String)>,
 }
@@ -122,6 +124,8 @@ impl Default for Settings {
             update_existing: true,
             backup: true,
             only_new: true,
+            auto_refresh: true,
+            copy_headers: false,
             mapping: HashMap::new(),
         }
     }
@@ -1177,9 +1181,13 @@ pub struct Preview {
     pub rows: Vec<Vec<(String, String)>>,
     pub files: usize,
     pub skipped: usize,
-    pub first_header: String,
-    pub first_col: String,
     pub from_sheet: bool,
+    /// column letter for each grid column (A, B, …)
+    pub letters: Vec<String>,
+    /// whether each grid column is filled by the app (false = "leave as is")
+    pub filled: Vec<bool>,
+    /// the spreadsheet row the first grid row lands on when pasted
+    pub start_row: u32,
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1219,8 +1227,9 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         rows.push(row);
     }
     Ok(Preview {
-        first_header: columns[0].clone(),
-        first_col: col_letter(lo),
+        letters: (lo..=hi).map(col_letter).collect(),
+        filled: (lo..=hi).map(|c| fields.contains_key(&c)).collect(),
+        start_row: last + 1,
         columns,
         rows,
         files: files.len(),

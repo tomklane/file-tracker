@@ -1,26 +1,34 @@
-// File Tracker — scan a folder and fill a tracking spreadsheet, or copy the
-// list straight into any spreadsheet. Native GUI for macOS and Windows.
+// File Tracker — scan a folder and lay the files out in your spreadsheet's
+// column layout in a live grid you can copy from, or update the sheet directly.
+// Native GUI for macOS and Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
 
 mod core;
 
 use crate::core::*;
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, StrokeKind};
 use egui_extras::{Column, TableBuilder};
+use notify::Watcher;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "File Tracker";
 const HINT: Color32 = Color32::from_rgb(128, 128, 128);
+const ROW_H: f32 = 22.0;
+const GUTTER_W: f32 = 54.0;
+/// wait this long after the last change before refreshing the grid
+const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(450);
+const FILES_DEBOUNCE: Duration = Duration::from_millis(900);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
-            .with_inner_size([920.0, 900.0])
-            .with_min_inner_size([760.0, 600.0]),
+            .with_inner_size([1420.0, 900.0])
+            .with_min_inner_size([1000.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
@@ -36,16 +44,48 @@ struct MapRow {
 enum Msg {
     Progress(String),
     Done(RunResult, bool),
-    Preview(Preview),
     Error(String),
 }
 
-struct ResultsView {
-    data: Preview,
-    selected: BTreeSet<usize>,
-    anchor: Option<usize>,
-    include_headers: bool,
-    msg: String,
+/// What the mouse is over in the grid.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Hit {
+    Cell(usize, usize),
+    Row(usize),
+    Col(usize),
+    Corner,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DragKind {
+    Cell,
+    Row,
+    Col,
+}
+
+/// A rectangular selection in grid coordinates: (row, column), inclusive.
+#[derive(Clone, Copy, Debug)]
+struct Sel {
+    a: (usize, usize),
+    b: (usize, usize),
+}
+
+impl Sel {
+    fn bounds(&self) -> (usize, usize, usize, usize) {
+        (self.a.0.min(self.b.0), self.a.0.max(self.b.0), self.a.1.min(self.b.1), self.a.1.max(self.b.1))
+    }
+    fn contains(&self, r: usize, c: usize) -> bool {
+        let (r0, r1, c0, c1) = self.bounds();
+        (r0..=r1).contains(&r) && (c0..=c1).contains(&c)
+    }
+    fn has_col(&self, c: usize) -> bool {
+        let (_, _, c0, c1) = self.bounds();
+        (c0..=c1).contains(&c)
+    }
+    fn has_row(&self, r: usize) -> bool {
+        let (r0, r1, _, _) = self.bounds();
+        (r0..=r1).contains(&r)
+    }
 }
 
 #[derive(PartialEq)]
@@ -59,8 +99,26 @@ enum Action {
     SaveSetup,
     LoadSetup,
     OpenSheet,
-    Run,
-    ShowList,
+    Update,
+    Refresh,
+    CopyAll,
+    CopySelection,
+}
+
+struct Grid {
+    data: Option<Preview>,
+    /// shown instead of the grid (e.g. "choose a folder")
+    message: Option<String>,
+    busy: bool,
+    rx: Option<mpsc::Receiver<Result<Preview, String>>>,
+    signature: String,
+    refresh_at: Option<Instant>,
+    updated_at: String,
+    sel: Option<Sel>,
+    drag: Option<DragKind>,
+    copy_msg: String,
+    /// visible on-screen areas of grid cells this frame, for mouse hit-testing
+    hits: Vec<(Rect, Hit)>,
 }
 
 struct App {
@@ -70,7 +128,11 @@ struct App {
     status: String,
     busy: bool,
     rx: Option<mpsc::Receiver<Msg>>,
-    results: Option<ResultsView>,
+    grid: Grid,
+    watchers: Vec<notify::RecommendedWatcher>,
+    watch_key: String,
+    files_changed: Arc<AtomicBool>,
+    ctx: egui::Context,
 }
 
 fn alert(text: &str) {
@@ -83,13 +145,37 @@ fn error(text: &str) {
 
 fn ask(text: &str) -> bool {
     matches!(
-        MessageDialog::new()
-            .set_title(APP_NAME)
-            .set_description(text)
-            .set_buttons(MessageButtons::YesNo)
-            .show(),
+        MessageDialog::new().set_title(APP_NAME).set_description(text).set_buttons(MessageButtons::YesNo).show(),
         MessageDialogResult::Yes
     )
+}
+
+fn paste_keys() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘V"
+    } else {
+        "Ctrl+V"
+    }
+}
+
+/// Does a file-system event mean the grid could be out of date?
+fn relevant_event(ev: &notify::Event, only: Option<&std::ffi::OsStr>) -> bool {
+    use notify::event::{EventKind, MetadataKind, ModifyKind};
+    match ev.kind {
+        EventKind::Access(_) => return false,
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => return false,
+        _ => {}
+    }
+    ev.paths.iter().any(|p| {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(only) = only {
+            return p.file_name() == Some(only);
+        }
+        !p.components().any(|c| c.as_os_str() == BACKUP_DIR)
+            && !name.starts_with("~$")
+            && !name.starts_with(".~lock")
+            && !name.eq_ignore_ascii_case(".ds_store")
+    })
 }
 
 impl App {
@@ -106,7 +192,23 @@ impl App {
             status: "Ready.".into(),
             busy: false,
             rx: None,
-            results: None,
+            grid: Grid {
+                data: None,
+                message: None,
+                busy: false,
+                rx: None,
+                signature: String::new(),
+                refresh_at: None,
+                updated_at: String::new(),
+                sel: None,
+                drag: None,
+                copy_msg: String::new(),
+                hits: vec![],
+            },
+            watchers: vec![],
+            watch_key: String::new(),
+            files_changed: Arc::new(AtomicBool::new(false)),
+            ctx: cc.egui_ctx.clone(),
         };
         app.apply_sheet_mode(true);
         app
@@ -196,7 +298,8 @@ impl App {
         match peek(&path, Some(&self.s.sheet_name), hr) {
             Ok(p) => {
                 let n = p.headers.len();
-                self.status = format!("Found {n} column{} on row {} of “{}”.", if n == 1 { "" } else { "s" }, p.header_row, p.sheet);
+                self.status =
+                    format!("Found {n} column{} on row {} of “{}”.", if n == 1 { "" } else { "s" }, p.header_row, p.sheet);
                 self.sheets = p.sheets;
                 self.s.sheet_name = p.sheet;
                 self.s.header_row = p.header_row;
@@ -211,9 +314,237 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ jobs
+
+    fn make_job(&self, sheet_path: Option<PathBuf>, create_new: bool) -> Job {
+        Job {
+            folder: PathBuf::from(self.s.folder.trim()),
+            scan: Arc::new(ScanOptions {
+                recursive: self.s.recursive,
+                skip_hidden: self.s.skip_hidden,
+                extensions: split_list(&self.s.extensions),
+                exclude: split_list(&self.s.exclude),
+            }),
+            sheet_path,
+            create_new,
+            new_columns: dedupe_headers(
+                split_list(&self.s.new_columns).into_iter().enumerate().map(|(i, c)| (i as u32 + 1, c)).collect(),
+            )
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect(),
+            sheet_name: self.s.sheet_name.clone(),
+            header_row: self.s.header_row,
+            mapping: self.mapping(),
+            key_header: self.s.key_header.clone(),
+            delimiter: self.s.delimiter.clone(),
+            fresh: !create_new && self.s.run_mode == "fresh",
+            update_existing: self.s.update_existing,
+            backup: self.s.backup,
+            only_new: self.s.only_new,
+        }
+    }
+
+    /// Everything the grid depends on. When this changes, the grid refreshes.
+    fn signature(&self) -> String {
+        let s = &self.s;
+        format!(
+            "{:?}",
+            (
+                (s.folder.trim(), s.recursive, s.skip_hidden, &s.extensions, &s.exclude),
+                (&s.sheet_mode, s.sheet_path.trim(), &s.sheet_name, s.header_row),
+                (&s.key_header, &s.delimiter, s.only_new),
+                self.rows.iter().map(|r| (r.col, &r.header, &r.field, &r.param)).collect::<Vec<_>>(),
+            )
+        )
+    }
+
+    fn start_grid_refresh(&mut self) {
+        let g = &mut self.grid;
+        g.refresh_at = None;
+        let folder = PathBuf::from(self.s.folder.trim());
+        let create_new = self.s.sheet_mode == "new";
+        let sheet = PathBuf::from(self.s.sheet_path.trim());
+        let problem = if self.s.folder.trim().is_empty() {
+            Some("Choose a folder to scan (section 1 on the left).")
+        } else if !folder.is_dir() {
+            Some("That folder can't be found. Check the folder in section 1.")
+        } else if !create_new && !sheet.is_file() {
+            Some("Choose your tracking spreadsheet in section 2,\nor pick “Create a new one” and type the columns you want.")
+        } else if self.rows.is_empty() {
+            Some("No columns found. Check the header row in section 2.")
+        } else if !self.rows.iter().any(|r| !r.field.is_empty()) {
+            Some("Choose what goes into at least one column (section 3).")
+        } else {
+            None
+        };
+        if let Some(p) = problem {
+            g.data = None;
+            g.message = Some(p.to_string());
+            g.sel = None;
+            return;
+        }
+        let job = self.make_job(if create_new { None } else { Some(sheet) }, create_new);
+        let (tx, rx) = mpsc::channel();
+        let g = &mut self.grid;
+        g.rx = Some(rx);
+        g.busy = true;
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = preview_job(&job, &|_m| {}).map_err(|e| e.0);
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_grid(&mut self) {
+        let Some(rx) = &self.grid.rx else { return };
+        let Ok(res) = rx.try_recv() else { return };
+        let g = &mut self.grid;
+        g.rx = None;
+        g.busy = false;
+        g.updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+        match res {
+            Ok(p) => {
+                // the list changed: the old selection would point at different files
+                let same = g.data.as_ref().map(|d| d.rows == p.rows && d.columns == p.columns).unwrap_or(false);
+                if !same {
+                    g.sel = None;
+                    g.copy_msg.clear();
+                }
+                g.message = None;
+                g.data = Some(p);
+            }
+            Err(e) => {
+                g.data = None;
+                g.sel = None;
+                g.message = Some(e);
+            }
+        }
+    }
+
+    /// Watch the scanned folder (and the spreadsheet) so the grid follows changes.
+    fn update_watchers(&mut self) {
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            self.s.auto_refresh,
+            self.s.folder.trim(),
+            self.s.recursive,
+            self.s.sheet_mode,
+            self.s.sheet_path.trim()
+        );
+        if key == self.watch_key {
+            return;
+        }
+        self.watch_key = key;
+        self.watchers.clear();
+        if !self.s.auto_refresh {
+            return;
+        }
+        let make = |only: Option<std::ffi::OsString>, flag: Arc<AtomicBool>, ctx: egui::Context| {
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(ev) = res {
+                    if relevant_event(&ev, only.as_deref()) {
+                        flag.store(true, Ordering::SeqCst);
+                        ctx.request_repaint();
+                    }
+                }
+            })
+        };
+        let folder = PathBuf::from(self.s.folder.trim());
+        if folder.is_dir() {
+            if let Ok(mut w) = make(None, self.files_changed.clone(), self.ctx.clone()) {
+                let mode = if self.s.recursive { notify::RecursiveMode::Recursive } else { notify::RecursiveMode::NonRecursive };
+                if w.watch(&folder, mode).is_ok() {
+                    self.watchers.push(w);
+                }
+            }
+        }
+        let sheet = PathBuf::from(self.s.sheet_path.trim());
+        if self.s.sheet_mode == "existing" && sheet.is_file() {
+            if let (Some(parent), Some(name)) = (sheet.parent(), sheet.file_name()) {
+                if let Ok(mut w) = make(Some(name.to_os_string()), self.files_changed.clone(), self.ctx.clone()) {
+                    if w.watch(parent, notify::RecursiveMode::NonRecursive).is_ok() {
+                        self.watchers.push(w);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decide whether the grid needs refreshing this frame.
+    fn schedule_grid(&mut self) {
+        let now = Instant::now();
+        let sig = self.signature();
+        if sig != self.grid.signature {
+            let first = self.grid.signature.is_empty();
+            self.grid.signature = sig;
+            self.grid.refresh_at = Some(if first { now } else { now + SETTINGS_DEBOUNCE });
+        }
+        if self.files_changed.swap(false, Ordering::SeqCst) && self.s.auto_refresh {
+            self.grid.refresh_at = Some(now + FILES_DEBOUNCE);
+        }
+        if let Some(t) = self.grid.refresh_at {
+            if now >= t && !self.grid.busy && !self.busy {
+                self.start_grid_refresh();
+            } else {
+                self.ctx.request_repaint_after(t.saturating_duration_since(now).max(Duration::from_millis(50)));
+            }
+        }
+        if self.grid.busy {
+            self.ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    // ------------------------------------------------------------ copy
+
+    fn copy_range(&mut self, r0: usize, r1: usize, c0: usize, c1: usize) {
+        let Some(d) = &self.grid.data else { return };
+        let mut lines = Vec::new();
+        if self.s.copy_headers {
+            lines.push(d.columns[c0..=c1].join("\t"));
+        }
+        for row in &d.rows[r0..=r1] {
+            lines.push(row[c0..=c1].iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\t"));
+        }
+        self.ctx.copy_text(lines.join("\n"));
+        let (nr, nc) = (r1 - r0 + 1, c1 - c0 + 1);
+        let target = if self.s.copy_headers {
+            "Paste into the top-left cell of an empty sheet".to_string()
+        } else {
+            format!("Click cell {}{} in your sheet and paste with {}", d.letters[c0], d.start_row as usize + r0, paste_keys())
+        };
+        self.grid.copy_msg = format!(
+            "Copied {nr} row{} × {nc} column{}. {target}.",
+            if nr == 1 { "" } else { "s" },
+            if nc == 1 { "" } else { "s" }
+        );
+    }
+
+    fn copy_all(&mut self) {
+        let Some(d) = &self.grid.data else { return };
+        if d.rows.is_empty() {
+            self.grid.copy_msg = "There are no rows to copy.".into();
+            return;
+        }
+        let (nr, nc) = (d.rows.len(), d.columns.len());
+        self.grid.sel = Some(Sel { a: (0, 0), b: (nr - 1, nc - 1) });
+        self.copy_range(0, nr - 1, 0, nc - 1);
+    }
+
+    fn copy_selection(&mut self) {
+        match self.grid.sel {
+            Some(sel) if self.grid.data.is_some() => {
+                let (r0, r1, c0, c1) = sel.bounds();
+                self.copy_range(r0, r1, c0, c1);
+            }
+            _ => self.grid.copy_msg = "Select some cells first (drag across them), or use Copy all rows.".into(),
+        }
+    }
+
     // ------------------------------------------------------------ actions
 
-    fn do_action(&mut self, a: Action, ctx: &egui::Context) {
+    fn do_action(&mut self, a: Action) {
         match a {
             Action::None => {}
             Action::BrowseFolder => {
@@ -257,7 +588,9 @@ impl App {
                 }
             }
             Action::LoadSetup => {
-                if let Some(f) = FileDialog::new().set_title("Load a saved setup").add_filter("File Tracker setup", &["json"]).pick_file() {
+                if let Some(f) =
+                    FileDialog::new().set_title("Load a saved setup").add_filter("File Tracker setup", &["json"]).pick_file()
+                {
                     match load_settings(&f) {
                         Some(s) => {
                             self.s = s;
@@ -276,12 +609,14 @@ impl App {
                     alert("There's no spreadsheet to open yet.");
                 }
             }
-            Action::Run => self.run(ctx, false),
-            Action::ShowList => self.run(ctx, true),
+            Action::Update => self.run_update(),
+            Action::Refresh => self.grid.refresh_at = Some(Instant::now()),
+            Action::CopyAll => self.copy_all(),
+            Action::CopySelection => self.copy_selection(),
         }
     }
 
-    fn run(&mut self, ctx: &egui::Context, preview: bool) {
+    fn run_update(&mut self) {
         if self.busy {
             return;
         }
@@ -295,39 +630,31 @@ impl App {
             return;
         }
         let create_new = self.s.sheet_mode == "new";
-        let sheet_path: Option<PathBuf> = if create_new {
-            if preview {
-                None
-            } else {
-                let start = folder.parent().unwrap_or(&folder).to_path_buf();
-                match FileDialog::new()
-                    .set_title("Save the new tracking spreadsheet as")
-                    .set_directory(start)
-                    .set_file_name("File Tracker.xlsx")
-                    .add_filter("Excel workbook", &["xlsx"])
-                    .add_filter("CSV file", &["csv"])
-                    .save_file()
-                {
-                    Some(mut p) => {
-                        if p.extension().is_none() {
-                            p.set_extension("xlsx");
-                        }
-                        Some(p)
+        let sheet_path = if create_new {
+            let start = folder.parent().unwrap_or(&folder).to_path_buf();
+            match FileDialog::new()
+                .set_title("Save the new tracking spreadsheet as")
+                .set_directory(start)
+                .set_file_name("File Tracker.xlsx")
+                .add_filter("Excel workbook", &["xlsx"])
+                .add_filter("CSV file", &["csv"])
+                .save_file()
+            {
+                Some(mut p) => {
+                    if p.extension().is_none() {
+                        p.set_extension("xlsx");
                     }
-                    None => return,
+                    p
                 }
+                None => return,
             }
         } else {
             let p = PathBuf::from(self.s.sheet_path.trim());
             if !p.is_file() {
-                alert(if preview {
-                    "Choose your spreadsheet in section 2, or switch to “Create a new one” and type the columns you want."
-                } else {
-                    "Choose your tracking spreadsheet (section 2)."
-                });
+                alert("Choose your tracking spreadsheet (section 2).");
                 return;
             }
-            if !preview && self.s.run_mode == "fresh" {
+            if self.s.run_mode == "fresh" {
                 let msg = format!(
                     "Start fresh?\n\nThis clears every row under the headers — including anything typed by hand — and rebuilds the list from the folder.\n\n{}\n\nContinue?",
                     if self.s.backup { "A backup copy is made first." } else { "Backups are switched OFF." }
@@ -336,65 +663,32 @@ impl App {
                     return;
                 }
             }
-            Some(p)
+            p
         };
 
         self.remember_mapping();
         save_settings(&self.s, &settings_file());
-        let job = Job {
-            folder,
-            scan: Arc::new(ScanOptions {
-                recursive: self.s.recursive,
-                skip_hidden: self.s.skip_hidden,
-                extensions: split_list(&self.s.extensions),
-                exclude: split_list(&self.s.exclude),
-            }),
-            sheet_path,
-            create_new,
-            new_columns: dedupe_headers(
-                split_list(&self.s.new_columns).into_iter().enumerate().map(|(i, c)| (i as u32 + 1, c)).collect(),
-            )
-            .into_iter()
-            .map(|(_, h)| h)
-            .collect(),
-            sheet_name: self.s.sheet_name.clone(),
-            header_row: self.s.header_row,
-            mapping: self.mapping(),
-            key_header: self.s.key_header.clone(),
-            delimiter: self.s.delimiter.clone(),
-            fresh: !create_new && self.s.run_mode == "fresh",
-            update_existing: self.s.update_existing,
-            backup: self.s.backup,
-            only_new: self.s.only_new,
-        };
-
+        let job = self.make_job(Some(sheet_path), create_new);
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.busy = true;
-        self.status = "Working…".into();
-        let ctx = ctx.clone();
+        self.status = "Updating spreadsheet…".into();
+        let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let report = |m: String| {
                 let _ = tx.send(Msg::Progress(m));
                 ctx.request_repaint();
             };
-            let msg = if preview {
-                match preview_job(&job, &report) {
-                    Ok(p) => Msg::Preview(p),
-                    Err(e) => Msg::Error(e.0),
-                }
-            } else {
-                match run_job(&job, &report) {
-                    Ok(r) => Msg::Done(r, job.create_new),
-                    Err(e) => Msg::Error(e.0),
-                }
+            let msg = match run_job(&job, &report) {
+                Ok(r) => Msg::Done(r, job.create_new),
+                Err(e) => Msg::Error(e.0),
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
     }
 
-    fn poll(&mut self) {
+    fn poll_update(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut finished = None;
         while let Ok(m) = rx.try_recv() {
@@ -411,25 +705,6 @@ impl App {
                 self.status = "Stopped — nothing was saved.".into();
                 error(&e);
             }
-            Msg::Preview(p) => {
-                let n = p.rows.len();
-                self.status = format!("Listed {n} of {} file(s) found — nothing was saved.", p.files);
-                if n == 0 {
-                    alert(if p.skipped > 0 {
-                        "No new files to list — everything in the folder is already in the spreadsheet."
-                    } else {
-                        "No files were found (check the folder and filters in section 1)."
-                    });
-                } else {
-                    self.results = Some(ResultsView {
-                        include_headers: !p.from_sheet,
-                        data: p,
-                        selected: BTreeSet::new(),
-                        anchor: None,
-                        msg: "Tip: click rows to select them (Ctrl/⌘ or Shift for several).".into(),
-                    });
-                }
-            }
             Msg::Done(r, created) => {
                 if created {
                     self.s.sheet_mode = "existing".into();
@@ -439,10 +714,15 @@ impl App {
                     self.apply_sheet_mode(true);
                 }
                 save_settings(&self.s, &settings_file());
+                self.grid.refresh_at = Some(Instant::now());
                 let name = r.path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let mut lines = vec![format!("{} files scanned.", r.files), format!("• {} new file(s) added", r.added)];
                 if r.matched > 0 {
-                    lines.push(format!("• {} already listed{}", r.matched, if r.refreshed { " (details refreshed)" } else { "" }));
+                    lines.push(format!(
+                        "• {} already listed{}",
+                        r.matched,
+                        if r.refreshed { " (details refreshed)" } else { "" }
+                    ));
                 }
                 if r.missing > 0 {
                     lines.push(format!(
@@ -463,7 +743,7 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ UI
+    // ------------------------------------------------------------ settings sidebar
 
     fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
@@ -475,64 +755,59 @@ impl App {
         ui.add_space(8.0);
     }
 
-    fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(118.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.set_min_width(118.0);
-                ui.label(label);
-            });
-            add(ui);
-        });
-    }
-
-    fn main_ui(&mut self, ui: &mut egui::Ui) -> Action {
+    fn sidebar(&mut self, ui: &mut egui::Ui) -> Action {
         let mut action = Action::None;
 
         Self::section(ui, "1   Folder to scan", |ui| {
-            Self::row(ui, "Folder:", |ui| {
-                let w = ui.available_width() - 90.0;
-                ui.add(egui::TextEdit::singleline(&mut self.s.folder).desired_width(w));
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 84.0;
+                ui.add(egui::TextEdit::singleline(&mut self.s.folder).desired_width(w).hint_text("Choose a folder…"));
                 if ui.button("Choose…").clicked() {
                     action = Action::BrowseFolder;
                 }
             });
-            Self::row(ui, "", |ui| {
+            ui.horizontal(|ui| {
                 ui.checkbox(&mut self.s.recursive, "Include subfolders");
-                ui.add_space(12.0);
                 ui.checkbox(&mut self.s.skip_hidden, "Skip hidden & system files");
             });
-            Self::row(ui, "Only these types:", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.s.extensions).desired_width(320.0));
-                ui.colored_label(HINT, "e.g. pdf, docx (blank = all)");
-            });
-            Self::row(ui, "Skip names like:", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.s.exclude).desired_width(320.0));
-                ui.colored_label(HINT, "e.g. *.tmp, Archive, Old*");
+            egui::Grid::new("s1").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Only these types:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.s.extensions)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. pdf, docx (blank = all)"),
+                );
+                ui.end_row();
+                ui.label("Skip names like:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.s.exclude)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. *.tmp, Archive, Old*"),
+                );
+                ui.end_row();
             });
         });
 
         Self::section(ui, "2   Tracking spreadsheet", |ui| {
-            ui.horizontal(|ui| {
-                if ui.radio_value(&mut self.s.sheet_mode, "existing".into(), "Use my existing spreadsheet (.xlsx, .xlsm, .csv)").changed() {
-                    action = Action::ApplySheetMode;
-                }
-                ui.add_space(12.0);
-                if ui.radio_value(&mut self.s.sheet_mode, "new".into(), "Create a new one").changed() {
-                    action = Action::ApplySheetMode;
-                }
-            });
-            let existing = self.s.sheet_mode == "existing";
-            Self::row(ui, "File:", |ui| {
-                let w = ui.available_width() - 90.0;
-                ui.add_enabled(existing, egui::TextEdit::singleline(&mut self.s.sheet_path).desired_width(w));
-                if ui.add_enabled(existing, egui::Button::new("Choose…")).clicked() {
-                    action = Action::BrowseSheet;
-                }
-            });
-            Self::row(ui, "Sheet:", |ui| {
-                ui.add_enabled_ui(existing, |ui| {
+            if ui.radio_value(&mut self.s.sheet_mode, "existing".into(), "Use my existing spreadsheet (.xlsx, .xlsm, .csv)").changed() {
+                action = Action::ApplySheetMode;
+            }
+            if ui.radio_value(&mut self.s.sheet_mode, "new".into(), "Start from new columns (no spreadsheet yet)").changed() {
+                action = Action::ApplySheetMode;
+            }
+            ui.add_space(2.0);
+            if self.s.sheet_mode == "existing" {
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 84.0;
+                    ui.add(egui::TextEdit::singleline(&mut self.s.sheet_path).desired_width(w).hint_text("Choose a spreadsheet…"));
+                    if ui.button("Choose…").clicked() {
+                        action = Action::BrowseSheet;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Sheet:");
                     let before = self.s.sheet_name.clone();
-                    egui::ComboBox::from_id_salt("sheet").width(200.0).selected_text(self.s.sheet_name.as_str()).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("sheet").width(130.0).selected_text(self.s.sheet_name.as_str()).show_ui(ui, |ui| {
                         for n in &self.sheets {
                             ui.selectable_value(&mut self.s.sheet_name, n.clone(), n);
                         }
@@ -540,66 +815,55 @@ impl App {
                     if self.s.sheet_name != before {
                         action = Action::ReloadColumns(true);
                     }
-                    ui.label("   Headers are on row:");
+                    ui.label("Header row:");
                     ui.add(egui::DragValue::new(&mut self.s.header_row).range(1..=500));
-                    if ui.button("Reload columns").clicked() {
+                    if ui.button("Reload").on_hover_text("Read the column headers again").clicked() {
                         action = Action::ReloadColumns(false);
                     }
                 });
-            });
-            Self::row(ui, "Columns:", |ui| {
-                let w = ui.available_width() - 150.0;
-                ui.add_enabled(!existing, egui::TextEdit::singleline(&mut self.s.new_columns).desired_width(w));
-                if ui.add_enabled(!existing, egui::Button::new("Use these columns")).clicked() {
+            } else {
+                ui.label("Column names, separated by commas:");
+                ui.add(egui::TextEdit::multiline(&mut self.s.new_columns).desired_rows(2).desired_width(f32::INFINITY));
+                if ui.button("Use these columns").clicked() {
                     action = Action::ApplyNewColumns;
                 }
-            });
+            }
         });
 
         Self::section(ui, "3   What goes in each column", |ui| {
-            ui.colored_label(
-                HINT,
-                "Columns set to “— leave as is —” are never changed, so your own status, notes and review columns stay safe.",
-            );
+            ui.colored_label(HINT, "“— leave as is —” columns stay blank in the grid and are never changed in your sheet.");
             ui.add_space(4.0);
-            egui::ScrollArea::vertical().id_salt("map").max_height(250.0).auto_shrink([false, true]).show(ui, |ui| {
-                if self.rows.is_empty() {
-                    ui.colored_label(HINT, "No columns yet — choose a spreadsheet above (or enter columns for a new one).");
-                    return;
-                }
+            if self.rows.is_empty() {
+                ui.colored_label(HINT, "No columns yet — choose a spreadsheet above.");
+            } else {
                 let mut changed = false;
-                egui::Grid::new("map_grid").num_columns(4).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-                    ui.strong("Column");
-                    ui.strong("Fill with");
-                    ui.strong("Setting");
-                    ui.label("");
-                    ui.end_row();
+                egui::Grid::new("map_grid").num_columns(3).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
                     for (i, r) in self.rows.iter_mut().enumerate() {
                         let mut head = r.header.clone();
-                        if head.chars().count() > 26 {
-                            head = head.chars().take(25).collect::<String>() + "…";
+                        if head.chars().count() > 18 {
+                            head = head.chars().take(17).collect::<String>() + "…";
                         }
-                        ui.label(format!("{}   {}", col_letter(r.col), head)).on_hover_text(&r.header);
+                        ui.label(format!("{}  {}", col_letter(r.col), head)).on_hover_text(&r.header);
                         let before = r.field.clone();
-                        egui::ComboBox::from_id_salt(("field", i)).width(270.0).selected_text(field(&r.field).label).show_ui(
-                            ui,
-                            |ui| {
+                        egui::ComboBox::from_id_salt(("field", i))
+                            .width(200.0)
+                            .selected_text(field(&r.field).label)
+                            .show_ui(ui, |ui| {
+                                ui.set_min_width(250.0);
                                 for f in FIELDS {
                                     ui.selectable_value(&mut r.field, f.key.to_string(), f.label);
                                 }
-                            },
-                        );
+                            });
                         if r.field != before {
                             r.param = field(&r.field).default.unwrap_or("").to_string();
                             changed = true;
                         }
                         let def = field(&r.field);
                         if def.default.is_some() {
-                            ui.add(egui::TextEdit::singleline(&mut r.param).desired_width(110.0));
+                            ui.add(egui::TextEdit::singleline(&mut r.param).desired_width(70.0)).on_hover_text(def.hint);
                         } else {
-                            ui.add_enabled(false, egui::TextEdit::singleline(&mut String::new()).desired_width(110.0));
+                            ui.label("");
                         }
-                        ui.colored_label(HINT, def.hint);
                         ui.end_row();
                     }
                 });
@@ -607,181 +871,377 @@ impl App {
                     self.remember_mapping();
                     self.refresh_key();
                 }
-            });
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Match files to existing rows using column:");
+                ui.label("Match files by:").on_hover_text("The column used to recognise files that are already in your sheet");
                 let choices = self.key_choices();
-                egui::ComboBox::from_id_salt("key").width(200.0).selected_text(self.s.key_header.as_str()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("key").width(140.0).selected_text(self.s.key_header.as_str()).show_ui(ui, |ui| {
                     for c in choices {
                         ui.selectable_value(&mut self.s.key_header, c.clone(), c);
                     }
                 });
-                ui.add_space(16.0);
-                ui.label("File-name separator:");
-                ui.add(egui::TextEdit::singleline(&mut self.s.delimiter).desired_width(28.0));
-                ui.colored_label(HINT, "(for “Part of the file name”)");
+                ui.label("Name separator:").on_hover_text("Splits file names for “Part of the file name”");
+                ui.add(egui::TextEdit::singleline(&mut self.s.delimiter).desired_width(24.0));
             });
         });
 
         Self::section(ui, "4   Options", |ui| {
-            ui.radio_value(&mut self.s.run_mode, "update".into(), "Add new files and keep existing rows (recommended)");
-            ui.radio_value(&mut self.s.run_mode, "fresh".into(), "Start fresh — clear every row under the headers and rebuild the list");
-            ui.add_space(2.0);
-            ui.checkbox(&mut self.s.update_existing, "Refresh details (size, dates, paths…) of files already listed");
-            ui.checkbox(&mut self.s.backup, format!("Back up the spreadsheet before saving (into a “{BACKUP_DIR}” folder)"));
-            ui.checkbox(&mut self.s.only_new, "In the copy list, show only files that aren't in the spreadsheet yet");
+            ui.checkbox(&mut self.s.only_new, "Grid lists only files not yet in the sheet");
+            ui.checkbox(&mut self.s.auto_refresh, "Update the grid when files change");
+            ui.add_space(4.0);
+            ui.label(RichText::new("When using “Update spreadsheet”:").color(HINT));
+            ui.radio_value(&mut self.s.run_mode, "update".into(), "Add new files, keep existing rows");
+            ui.radio_value(&mut self.s.run_mode, "fresh".into(), "Start fresh (clear rows and rebuild)");
+            ui.checkbox(&mut self.s.update_existing, "Refresh details of files already listed");
+            ui.checkbox(&mut self.s.backup, "Back up the spreadsheet first");
+        });
+
+        ui.horizontal(|ui| {
+            if ui.button("Save setup…").clicked() {
+                action = Action::SaveSetup;
+            }
+            if ui.button("Load setup…").clicked() {
+                action = Action::LoadSetup;
+            }
+            if ui.button("Open spreadsheet").clicked() {
+                action = Action::OpenSheet;
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if self.busy {
+                ui.spinner();
+            }
+            ui.colored_label(HINT, self.status.as_str());
         });
         action
     }
-}
 
-fn results_ui(ui: &mut egui::Ui, rv: &mut ResultsView, close: &mut bool) {
-    let ctx = ui.ctx().clone();
-    let n = rv.data.rows.len();
-    let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
+    // ------------------------------------------------------------ grid
 
-    let copy = |rv: &mut ResultsView, only_selected: bool| {
-        let idx: Vec<usize> = if only_selected { rv.selected.iter().copied().collect() } else { (0..n).collect() };
-        if idx.is_empty() {
-            rv.msg = "Select one or more rows first (or use Copy all).".into();
-            return;
-        }
-        let mut lines = Vec::new();
-        if rv.include_headers {
-            lines.push(rv.data.columns.join("\t"));
-        }
-        for i in &idx {
-            lines.push(rv.data.rows[*i].iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\t"));
-        }
-        ctx.copy_text(lines.join("\n"));
-        rv.msg = format!("Copied {} row{}. Now paste into your spreadsheet.", idx.len(), if idx.len() == 1 { "" } else { "s" });
-    };
-
-    // Keyboard: Ctrl/⌘+C copies (selected rows if any), Ctrl/⌘+A selects all
-    let (copy_key, select_all, mods) = ui.input(|i| {
-        (
-            i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
-            i.modifiers.command && i.key_pressed(egui::Key::A),
-            // modifier keys held during the click itself (most reliable across platforms)
-            i.events
-                .iter()
-                .rev()
-                .find_map(|e| match e {
-                    egui::Event::PointerButton { modifiers, .. } => Some(*modifiers | i.modifiers),
-                    _ => None,
-                })
-                .unwrap_or(i.modifiers),
-        )
-    });
-    if select_all {
-        rv.selected = (0..n).collect();
-    }
-    if copy_key {
-        let sel = !rv.selected.is_empty();
-        copy(rv, sel);
-    }
-
-    egui::Panel::top("results_top").show(ui, |ui| {
-        ui.add_space(6.0);
-        let mut text = if rv.data.from_sheet {
-            format!(
-                "In your spreadsheet, click the first empty cell under “{}” (column {}) and paste with {paste}.",
-                rv.data.first_header, rv.data.first_col
-            )
-        } else {
-            format!("Click a cell in any spreadsheet and paste with {paste}.")
-        };
-        if rv.data.skipped > 0 {
-            text += &format!("  ({} file(s) already in the spreadsheet were left out.)", rv.data.skipped);
-        }
-        ui.label(text);
-        ui.add_space(4.0);
-    });
-
-    egui::Panel::bottom("results_bottom").show(ui, |ui| {
-        ui.add_space(6.0);
+    fn grid_toolbar(&mut self, ui: &mut egui::Ui) -> Action {
+        let mut action = Action::None;
         ui.horizontal(|ui| {
-            ui.checkbox(&mut rv.include_headers, "Include the header row");
-            ui.colored_label(HINT, rv.msg.as_str());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Close").clicked() {
-                    *close = true;
-                }
-                if ui.button("Copy selected rows").clicked() {
-                    copy(rv, true);
-                }
-                if ui.button(RichText::new("Copy all").strong()).clicked() {
-                    copy(rv, false);
-                }
-            });
-        });
-        ui.add_space(6.0);
-    });
-
-    egui::CentralPanel::default().show(ui, |ui| {
-        let ncols = rv.data.columns.len();
-        let mut clicked: Option<usize> = None;
-        egui::ScrollArea::horizontal()
-            .id_salt("results_h")
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .show(ui, |ui| {
-            let mut tb = TableBuilder::new(ui)
-                .id_salt("results_table")
-                .striped(true)
-                .resizable(true)
-                .sense(egui::Sense::click())
-                .cell_layout(Layout::left_to_right(Align::Center));
-            for c in 0..ncols {
-                let longest = rv.data.rows.iter().take(300).map(|r| r[c].0.chars().count()).max().unwrap_or(0);
-                let chars = longest.max(rv.data.columns[c].chars().count());
-                tb = tb.column(Column::initial((chars as f32 * 7.5 + 18.0).clamp(60.0, 420.0)).at_least(40.0).clip(true));
-            }
-            tb.header(24.0, |mut h| {
-                for name in &rv.data.columns {
-                    h.col(|ui| {
-                        ui.strong(name);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(20.0, n, |mut row| {
-                    let i = row.index();
-                    row.set_selected(rv.selected.contains(&i));
-                    for (shown, _) in &rv.data.rows[i] {
-                        row.col(|ui| {
-                            ui.add(egui::Label::new(shown.as_str()).selectable(false).truncate());
-                        });
+            ui.label(RichText::new("Grid").strong().size(17.0));
+            ui.add_space(6.0);
+            let summary = match &self.grid.data {
+                Some(d) => {
+                    let n = d.rows.len();
+                    let what = if d.from_sheet && self.s.only_new { "new file" } else { "file" };
+                    let mut t = format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                    if d.skipped > 0 {
+                        t += &format!("  ·  {} already in the sheet", d.skipped);
                     }
-                    if row.response().clicked() {
-                        clicked = Some(i);
+                    t
+                }
+                None => String::new(),
+            };
+            let found = self.grid.data.as_ref().map(|d| d.files).unwrap_or(0);
+            ui.label(summary).on_hover_text(format!("{found} files found in the folder"));
+            if self.grid.busy {
+                ui.spinner();
+                ui.colored_label(HINT, "updating…");
+            } else if !self.grid.updated_at.is_empty() {
+                ui.colored_label(HINT, format!("·  updated {}", self.grid.updated_at));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    if ui
+                        .button(RichText::new("Update spreadsheet  ▶").strong())
+                        .on_hover_text("Write the new files straight into your spreadsheet file")
+                        .clicked()
+                    {
+                        action = Action::Update;
                     }
                 });
+                if ui.button("Refresh").on_hover_text("Scan the folder again now").clicked() {
+                    action = Action::Refresh;
+                }
             });
         });
-        if let Some(i) = clicked {
-            if mods.shift {
-                let a = rv.anchor.unwrap_or(i);
-                rv.selected = (a.min(i)..=a.max(i)).collect();
-            } else if mods.command {
-                if !rv.selected.remove(&i) {
-                    rv.selected.insert(i);
+        ui.horizontal(|ui| {
+            let has = self.grid.data.as_ref().map(|d| !d.rows.is_empty()).unwrap_or(false);
+            ui.add_enabled_ui(has, |ui| {
+                if ui.button(RichText::new("Copy selection").strong()).clicked() {
+                    action = Action::CopySelection;
                 }
-                rv.anchor = Some(i);
+                if ui.button("Copy all rows").clicked() {
+                    action = Action::CopyAll;
+                }
+            });
+            ui.checkbox(&mut self.s.copy_headers, "Include header row");
+            ui.add_space(8.0);
+            let hint = if !self.grid.copy_msg.is_empty() {
+                self.grid.copy_msg.clone()
+            } else if let Some(d) = &self.grid.data {
+                let (r, c) = self.grid.sel.map(|s| (s.bounds().0, s.bounds().2)).unwrap_or((0, 0));
+                if d.rows.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "Drag across cells to select, then copy (⌘C / Ctrl+C). Paste at cell {}{} in your sheet.",
+                        d.letters.get(c).cloned().unwrap_or_default(),
+                        d.start_row as usize + r
+                    )
+                }
             } else {
-                rv.selected = BTreeSet::from([i]);
-                rv.anchor = Some(i);
+                String::new()
+            };
+            ui.add(egui::Label::new(RichText::new(hint).color(HINT)).truncate()).on_hover_text(
+                "Drag across cells to select them. Shift-click extends the selection. \
+                 Click a column letter or a row number to select the whole column or row. \
+                 Ctrl/⌘+A selects everything, Esc clears.",
+            );
+        });
+        action
+    }
+
+    fn grid_view(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = &self.grid.data else {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                if self.grid.busy {
+                    ui.spinner();
+                    ui.colored_label(HINT, "Scanning…");
+                } else {
+                    ui.label(
+                        RichText::new(self.grid.message.as_deref().unwrap_or("Choose a folder and a spreadsheet on the left."))
+                            .size(16.0)
+                            .color(HINT),
+                    );
+                }
+            });
+            return;
+        };
+        if d.rows.is_empty() {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                let msg = if d.skipped > 0 {
+                    format!(
+                        "Everything in the folder is already in your sheet ({} files).\nNew files will appear here automatically.",
+                        d.skipped
+                    )
+                } else {
+                    "No files found. Check the folder and the filters in section 1.".to_string()
+                };
+                ui.label(RichText::new(msg).size(16.0).color(HINT));
+            });
+            return;
+        }
+
+        let nrows = d.rows.len();
+        let ncols = d.columns.len();
+        let sel = self.grid.sel;
+        let visuals = ui.visuals().clone();
+        let sel_fill = visuals.selection.bg_fill.gamma_multiply(0.45);
+        let head_fill = visuals.faint_bg_color.gamma_multiply(1.6);
+        let head_sel_fill = visuals.selection.bg_fill.gamma_multiply(0.7);
+        let blank_fill = visuals.extreme_bg_color.gamma_multiply(0.6);
+        let line = Stroke::new(0.5, visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.8));
+        let mut hits: Vec<(Rect, Hit)> = Vec::new();
+        let table_key = d.columns.join("\u{1f}");
+
+        let paint_cell = |ui: &mut egui::Ui, fill: Option<Color32>| {
+            let r = ui.max_rect();
+            if let Some(f) = fill {
+                ui.painter().rect_filled(r, 0.0, f);
+            }
+            ui.painter().rect_stroke(r, 0.0, line, StrokeKind::Inside);
+            r.intersect(ui.clip_rect())
+        };
+
+        egui::ScrollArea::horizontal()
+            .id_salt("grid_h")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                let mut tb = TableBuilder::new(ui)
+                    .id_salt(("grid", &table_key))
+                    .striped(false)
+                    .resizable(true)
+                    .vscroll(true)
+                    .auto_shrink([false, false])
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::exact(GUTTER_W));
+                for c in 0..ncols {
+                    let longest = d.rows.iter().take(300).map(|r| r[c].0.chars().count()).max().unwrap_or(0);
+                    let chars = longest.max(d.columns[c].chars().count()).max(4);
+                    tb = tb.column(Column::initial((chars as f32 * 7.2 + 20.0).clamp(56.0, 380.0)).at_least(36.0).clip(true));
+                }
+                tb.header(42.0, |mut h| {
+                    h.col(|ui| {
+                        let r = paint_cell(ui, Some(head_fill));
+                        hits.push((r, Hit::Corner));
+                    });
+                    for c in 0..ncols {
+                        h.col(|ui| {
+                            let selected = sel.map(|s| s.has_col(c)).unwrap_or(false);
+                            let r = paint_cell(ui, Some(if selected { head_sel_fill } else { head_fill }));
+                            hits.push((r, Hit::Col(c)));
+                            ui.add_space(5.0);
+                            ui.vertical(|ui| {
+                                ui.add_space(3.0);
+                                ui.label(RichText::new(&d.letters[c]).small().color(HINT));
+                                let name = RichText::new(&d.columns[c]).strong();
+                                let name = if d.filled[c] { name } else { name.italics().color(HINT) };
+                                let resp = ui.add(egui::Label::new(name).truncate().selectable(false));
+                                if !d.filled[c] {
+                                    resp.on_hover_text("Left as is — this column pastes as blank so the others line up.");
+                                }
+                            });
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_H, nrows, |mut row| {
+                        let i = row.index();
+                        let row_sel = sel.map(|s| s.has_row(i)).unwrap_or(false);
+                        row.col(|ui| {
+                            let r = paint_cell(ui, Some(if row_sel { head_sel_fill } else { head_fill }));
+                            hits.push((r, Hit::Row(i)));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(6.0);
+                                ui.label(RichText::new((d.start_row as usize + i).to_string()).small().color(HINT));
+                            });
+                        });
+                        for (c, (shown, _)) in d.rows[i].iter().enumerate() {
+                            row.col(|ui| {
+                                let fill = if sel.map(|s| s.contains(i, c)).unwrap_or(false) {
+                                    Some(sel_fill)
+                                } else if !d.filled[c] {
+                                    Some(blank_fill)
+                                } else {
+                                    None
+                                };
+                                let r = paint_cell(ui, fill);
+                                hits.push((r, Hit::Cell(i, c)));
+                                ui.add_space(5.0);
+                                ui.add(egui::Label::new(shown.as_str()).selectable(false).truncate());
+                            });
+                        }
+                    });
+                });
+            });
+        self.grid.hits = hits;
+        self.grid_mouse(ui.ctx(), nrows, ncols);
+    }
+
+    fn hit_at(&self, pos: Pos2) -> Option<Hit> {
+        self.grid.hits.iter().find(|(r, _)| r.contains(pos)).map(|(_, h)| *h)
+    }
+
+    /// Excel-style mouse selection: drag across cells, Shift-click to extend,
+    /// click a column letter or row number to take the whole column or row.
+    fn grid_mouse(&mut self, ctx: &egui::Context, nrows: usize, ncols: usize) {
+        let (press_pos, down, pos, shift) = ctx.input(|i| {
+            // read the press from the event itself: a quick click or trackpad tap
+            // can press and release within one frame
+            let press = i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers } => {
+                    Some((*pos, modifiers.shift))
+                }
+                _ => None,
+            });
+            (press, i.pointer.primary_down(), i.pointer.latest_pos(), i.modifiers.shift)
+        });
+        let pressed = press_pos.is_some();
+        let shift = press_pos.map(|(_, s)| s || shift).unwrap_or(shift);
+        let press_pos = press_pos.map(|(p, _)| p);
+        let on_grid_layer =
+            |p: Pos2| ctx.layer_id_at(p).map(|l| l.order == egui::Order::Background).unwrap_or(false);
+
+        if pressed {
+            if let Some(p) = press_pos.filter(|p| on_grid_layer(*p)) {
+                if let Some(hit) = self.hit_at(p) {
+                    ctx.memory_mut(|m| m.stop_text_input());
+                    self.grid.copy_msg.clear();
+                    let last_c = ncols - 1;
+                    let cur = self.grid.sel;
+                    let (sel, drag) = match hit {
+                        Hit::Cell(r, c) => match (shift, cur) {
+                            (true, Some(s)) => (Sel { a: s.a, b: (r, c) }, DragKind::Cell),
+                            _ => (Sel { a: (r, c), b: (r, c) }, DragKind::Cell),
+                        },
+                        Hit::Row(r) => match (shift, cur) {
+                            (true, Some(s)) => (Sel { a: (s.a.0, 0), b: (r, last_c) }, DragKind::Row),
+                            _ => (Sel { a: (r, 0), b: (r, last_c) }, DragKind::Row),
+                        },
+                        Hit::Col(c) => match (shift, cur) {
+                            (true, Some(s)) => (Sel { a: (0, s.a.1), b: (nrows - 1, c) }, DragKind::Col),
+                            _ => (Sel { a: (0, c), b: (nrows - 1, c) }, DragKind::Col),
+                        },
+                        Hit::Corner => (Sel { a: (0, 0), b: (nrows - 1, last_c) }, DragKind::Cell),
+                    };
+                    self.grid.sel = Some(sel);
+                    self.grid.drag = if hit == Hit::Corner { None } else { Some(drag) };
+                }
             }
         }
-    });
+
+        if let (true, Some(kind), Some(p), Some(sel)) = (down, self.grid.drag, pos, self.grid.sel.as_mut()) {
+            if let Some(hit) = self.grid.hits.iter().find(|(r, _)| r.contains(p)).map(|(_, h)| *h) {
+                let (r, c) = match hit {
+                    Hit::Cell(r, c) => (Some(r), Some(c)),
+                    Hit::Row(r) => (Some(r), None),
+                    Hit::Col(c) => (None, Some(c)),
+                    Hit::Corner => (None, None),
+                };
+                match kind {
+                    DragKind::Cell => sel.b = (r.unwrap_or(sel.b.0), c.unwrap_or(sel.b.1)),
+                    DragKind::Row => {
+                        if let Some(r) = r {
+                            sel.b = (r, ncols - 1)
+                        }
+                    }
+                    DragKind::Col => {
+                        if let Some(c) = c {
+                            sel.b = (nrows - 1, c)
+                        }
+                    }
+                }
+            }
+        }
+        if !down {
+            self.grid.drag = None;
+        }
+    }
+
+    /// Keyboard shortcuts for the grid (only when no text box has the cursor).
+    fn grid_keys(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused()).is_some() {
+            return;
+        }
+        let (copy, all, esc) = ctx.input(|i| {
+            (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.modifiers.command && i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let dims = self.grid.data.as_ref().map(|d| (d.rows.len(), d.columns.len())).filter(|(r, _)| *r > 0);
+        if all {
+            if let Some((nr, nc)) = dims {
+                self.grid.sel = Some(Sel { a: (0, 0), b: (nr - 1, nc - 1) });
+            }
+        }
+        if esc {
+            self.grid.sel = None;
+            self.grid.copy_msg.clear();
+        }
+        if copy {
+            self.copy_selection();
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll();
+        self.poll_update();
+        self.poll_grid();
         if self.busy {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         if ui.input(|i| i.viewport().close_requested()) {
             self.remember_mapping();
@@ -789,71 +1249,39 @@ impl eframe::App for App {
         }
 
         let mut action = Action::None;
-        egui::Panel::bottom("actions").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save setup…").clicked() {
-                    action = Action::SaveSetup;
-                }
-                if ui.button("Load setup…").clicked() {
-                    action = Action::LoadSetup;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled_ui(!self.busy, |ui| {
-                        if ui.button(RichText::new("Update spreadsheet  ▶").strong()).clicked() {
-                            action = Action::Run;
-                        }
-                        if ui.button(RichText::new("Show list to copy").strong()).clicked() {
-                            action = Action::ShowList;
-                        }
-                    });
-                    if ui.button("Open spreadsheet").clicked() {
-                        action = Action::OpenSheet;
+        egui::Panel::left("settings")
+            .resizable(true)
+            .default_size(470.0)
+            .size_range(380.0..=700.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("side").show(ui, |ui| {
+                    ui.add_space(8.0);
+                    let a = self.sidebar(ui);
+                    if a != Action::None {
+                        action = a;
                     }
+                    ui.add_space(8.0);
                 });
             });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if self.busy {
-                    ui.spinner();
-                }
-                ui.label(self.status.as_str());
-            });
+
+        egui::Panel::top("grid_toolbar").show(ui, |ui| {
             ui.add_space(6.0);
+            let a = self.grid_toolbar(ui);
+            if a != Action::None {
+                action = a;
+            }
+            ui.add_space(4.0);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("main").show(ui, |ui| {
-                let a = self.main_ui(ui);
-                if a != Action::None {
-                    action = a;
-                }
-            });
+            self.grid_view(ui);
         });
-        if action != Action::None {
-            self.do_action(action, &ctx);
-        }
 
-        if let Some(rv) = &mut self.results {
-            let mut close = false;
-            let n = rv.data.rows.len();
-            let title = format!("{APP_NAME} — {n} file{} ready to copy", if n == 1 { "" } else { "s" });
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("results"),
-                egui::ViewportBuilder::default()
-                    .with_title(title)
-                    .with_inner_size([1050.0, 600.0])
-                    .with_min_inner_size([600.0, 320.0]),
-                |ui, _class| {
-                    results_ui(ui, rv, &mut close);
-                    if ui.input(|i| i.viewport().close_requested()) {
-                        close = true;
-                    }
-                },
-            );
-            if close {
-                self.results = None;
-            }
+        self.grid_keys(&ctx);
+        if action != Action::None {
+            self.do_action(action);
         }
+        self.update_watchers();
+        self.schedule_grid();
     }
 }

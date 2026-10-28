@@ -1,11 +1,10 @@
 # File Tracker
 
 A desktop app for **macOS and Windows**. It scans a folder (as seen in Finder
-or File Explorer) and either:
-
-- shows the files in a window you can **copy and paste** into any
-  spreadsheet (Excel, Numbers, Google Sheets), or
-- **updates your tracking spreadsheet** (.xlsx, .xlsm, .csv) directly.
+or File Explorer) and lays the files out in a **live grid** that matches your
+spreadsheet's columns. You select cells in the grid and paste them straight
+into Excel, Numbers or Google Sheets. It can also **update your tracking
+spreadsheet** (.xlsx, .xlsm, .csv) directly.
 
 It reads the columns your spreadsheet already has, and you choose what goes
 in each one. That means it works with any folder layout and any spreadsheet
@@ -27,26 +26,35 @@ Go to **[Releases](../../releases/latest)** and download:
 
 ## Using it
 
+Settings are on the left and the grid is on the right. The grid updates by
+itself whenever you change a setting or add, rename or delete files in the
+folder.
+
 1. **Folder to scan.** Choose the top folder. You can limit it to file types
    (`pdf, docx`) or skip names (`*.tmp, Archive, Old*`).
 2. **Tracking spreadsheet.** Choose your existing tracker. The app finds the
    header row itself, even below a title, and you can change it. Or choose
-   **Create a new one** and type the column names you want.
+   **Start from new columns** and type the column names you want.
 3. **What goes in each column.** Choose from: file name, part of the file
    name (`PRJ001_Beam-Layout_RevA` gives part 1 = `PRJ001` and
    part -1 = `RevA`), folder at a level, path, clickable link, size, dates,
    a running ID (`DOC-###`), Present/Missing, or fixed text. Columns left on
-   **leave as is** are never touched.
-4. Click one of the two main buttons:
-   - **Show list to copy** opens a window of the files in your sheet's column
-     order. Click **Copy all**, or click rows to select them
-     (Ctrl/⌘‑click or Shift‑click for several) and press Ctrl+C or ⌘C. Then
-     paste into the first empty row of your sheet. Nothing is saved to your
-     file. By default, only files not yet in the sheet are listed.
-   - **Update spreadsheet** writes straight into the file. New files are
-     added at the bottom and existing rows are refreshed. Deleted files are
-     flagged if you mapped a Present/Missing column. A backup goes into
-     `_tracker_backups` first.
+   **leave as is** stay blank in the grid and are never touched in your sheet.
+4. **Copy from the grid.** The grid shows your sheet's column letters and
+   the actual row numbers the files will land on. By default it lists only
+   files that aren't in your sheet yet.
+   - Drag across cells to select them. Shift-click extends the selection.
+     Click a column letter or a row number to take a whole column or row.
+     Ctrl/⌘+A selects everything.
+   - Press Ctrl+C or ⌘C (or click **Copy selection** or **Copy all rows**).
+   - The app tells you which cell to click in your sheet (e.g. "Paste at
+     cell A12"). Click it and paste.
+   - Tick **Include header row** to copy the column names too.
+
+**Update spreadsheet** writes straight into the file instead. New files are
+added at the bottom and existing rows are refreshed. Deleted files are
+flagged if you mapped a Present/Missing column. A backup goes into
+`_tracker_backups` first.
 
 Your setup is remembered between runs. Use **Save setup…** and
 **Load setup…** to keep one setup per project.
