@@ -114,6 +114,8 @@ pub struct Settings {
     /// what each row is: "files", "level" (folders at folder_level) or "withfiles"
     pub row_mode: String,
     pub folder_level: u32,
+    /// for row_mode "pattern": which folder names make a row
+    pub folder_pattern: String,
     pub show_sidebar: bool,
     /// 1000 (like Finder) or 1024 (like Windows)
     pub size_base: u32,
@@ -148,6 +150,7 @@ impl Default for Settings {
             skip_version: String::new(),
             row_mode: "files".into(),
             folder_level: 1,
+            folder_pattern: DATE_FOLDER_PATTERN.into(),
             show_sidebar: true,
             size_base: default_size_base(),
             mapping: HashMap::new(),
@@ -377,7 +380,9 @@ pub fn auto_field(header: &str) -> &'static str {
             "size_h"
         };
     }
-    if has(&["file count", "number of files", "no of files", "num files", "files count"]) || t == "count" || t == "# files" {
+    if has(&["file count", "number of files", "no of files", "num files", "files count", "clip count", "number of clips", "no of clips", "clips count"])
+        || ["count", "# files", "# clips", "clips"].contains(&t.as_str())
+    {
         return "count";
     }
     if has(&["folder", "directory"]) {
@@ -466,7 +471,7 @@ fn is_hidden(path: &Path, md: &fs::Metadata) -> bool {
 }
 
 /// What each grid row stands for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RowMode {
     Files,
     /// folders at this depth (1 = folders directly inside the scanned folder),
@@ -474,13 +479,20 @@ pub enum RowMode {
     FolderLevel(u32),
     /// every folder that holds files, with the size of its own files
     FoldersWithFiles,
+    /// folders whose names match this pattern (e.g. card folders that start
+    /// with a date), at any depth, each with the total of everything inside
+    FolderPattern(String),
 }
 
+/// The usual card-folder pattern: names that start with a date like 20261025_
+pub const DATE_FOLDER_PATTERN: &str = r"^\d{8}_";
+
 impl RowMode {
-    pub fn from_settings(mode: &str, level: u32) -> Self {
+    pub fn from_settings(mode: &str, level: u32, pattern: &str) -> Self {
         match mode {
             "level" => RowMode::FolderLevel(level.max(1)),
             "withfiles" => RowMode::FoldersWithFiles,
+            "pattern" => RowMode::FolderPattern(if pattern.trim().is_empty() { DATE_FOLDER_PATTERN.into() } else { pattern.trim().into() }),
             _ => RowMode::Files,
         }
     }
@@ -641,8 +653,12 @@ pub fn scan_folder(
 }
 
 /// Turn a list of files into one row per folder, adding up sizes.
-pub fn folder_rows(root: &Path, files: &[FileInfo], mode: RowMode) -> Vec<FileInfo> {
+pub fn folder_rows(root: &Path, files: &[FileInfo], mode: &RowMode) -> Vec<FileInfo> {
     use std::collections::BTreeMap;
+    let pattern = match mode {
+        RowMode::FolderPattern(p) => regex::RegexBuilder::new(p).case_insensitive(true).build().ok(),
+        _ => None,
+    };
     let root_name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     // key: folder path inside the scanned folder (lower case, for ordering)
     let mut groups: BTreeMap<Vec<String>, (Vec<String>, u64, u64, NaiveDateTime)> = BTreeMap::new();
@@ -650,13 +666,21 @@ pub fn folder_rows(root: &Path, files: &[FileInfo], mode: RowMode) -> Vec<FileIn
         let inner = &f.folders[1..];
         let key: Vec<String> = match mode {
             RowMode::FolderLevel(n) => {
-                let n = n as usize;
+                let n = *n as usize;
                 if inner.len() < n {
                     continue; // files that sit above that level
                 }
                 inner[..n].to_vec()
             }
             RowMode::FoldersWithFiles => inner.to_vec(),
+            RowMode::FolderPattern(_) => {
+                // the outermost folder (below the scanned one) whose name matches
+                let Some(rx) = &pattern else { return vec![] };
+                match inner.iter().position(|name| rx.is_match(name)) {
+                    Some(k) => inner[..=k].to_vec(),
+                    None => continue,
+                }
+            }
             RowMode::Files => return files.to_vec(),
         };
         let lower: Vec<String> = key.iter().map(|k| k.to_lowercase()).collect();
@@ -722,7 +746,12 @@ pub struct Ctx {
     pub today: NaiveDate,
     /// 1000 (like Finder) or 1024 (like Windows)
     pub base: f64,
+    /// tables for custom rules that look values up in another sheet
+    pub lookups: Lookups,
 }
+
+/// Lookup tables read from the spreadsheet: key → (lower-case value → result).
+pub type Lookups = HashMap<String, HashMap<String, String>>;
 
 fn round_to(v: f64, places: i32) -> f64 {
     let m = 10f64.powi(places);
@@ -773,7 +802,15 @@ pub fn field_value(f: &str, param: &str, info: &FileInfo, ctx: &Ctx) -> Val {
         "scanned" => Val::Date(ctx.today),
         "status" => Val::Text(status_texts(param).0),
         "text" => t(param),
-        "extract" => Val::Text(crate::extract::apply(&crate::extract::parse(param), info).text),
+        "extract" => {
+            let r = crate::extract::parse(param);
+            let table = r.lookup_key().and_then(|k| ctx.lookups.get(&k));
+            let e = crate::extract::apply_with(&r, info, table);
+            match e.date {
+                Some(d) => Val::Date(d),
+                None => Val::Text(e.text),
+            }
+        }
         _ => t(""),
     }
 }
@@ -958,6 +995,17 @@ pub fn peek(path: &Path, sheet: Option<&str>, header_row: Option<u32>) -> Res<Pe
     })
 }
 
+/// The columns that decide where the data ends: the ones the app fills, plus
+/// the match column. Columns it leaves alone (checkboxes, notes, statuses
+/// that are pre-filled down the sheet) don't count.
+fn data_cols(p: &Prepared) -> Vec<u32> {
+    let mut cols: Vec<u32> = p.plan.iter().map(|(c, _, _)| *c).collect();
+    cols.push(p.key.0);
+    cols.sort();
+    cols.dedup();
+    cols
+}
+
 fn last_data_row(ws: &umya::Worksheet, hr: u32, cols: &[u32]) -> u32 {
     let mut r = ws.get_highest_row();
     while r > hr {
@@ -1136,6 +1184,7 @@ struct Prepared {
     plan: Vec<(u32, String, String)>,
     key: (u32, String, String),
     is_csv: bool,
+    lookups: Lookups,
 }
 
 fn prepare(j: &Job, progress: &dyn Fn(String)) -> Res<Prepared> {
@@ -1176,14 +1225,49 @@ fn prepare(j: &Job, progress: &dyn Fn(String)) -> Res<Prepared> {
         .or_else(|| plan.iter().find(|(_, f, _)| !BAD_KEYS.contains(&f.as_str())))
         .unwrap_or(&plan[0])
         .clone();
-    Ok(Prepared { book, hr, headers, plan, key, is_csv })
+    let lookups = load_lookups(&book, &plan);
+    Ok(Prepared { book, hr, headers, plan, key, is_csv, lookups })
+}
+
+/// Read the tables that custom rules look values up in (e.g. initials → name
+/// from a "Shooter List" sheet). Missing sheets just give empty tables.
+fn load_lookups(book: &Book, plan: &[(u32, String, String)]) -> Lookups {
+    let mut out = Lookups::new();
+    if book.csv_delim.is_some() {
+        return out;
+    }
+    for (_, f, prm) in plan {
+        if f != "extract" {
+            continue;
+        }
+        let r = crate::extract::parse(prm);
+        let Some(key) = r.lookup_key() else { continue };
+        if out.contains_key(&key) {
+            continue;
+        }
+        let mut table = HashMap::new();
+        if let Some(ws) = book.book.get_sheet_by_name(&r.lookup_sheet) {
+            let (fc, rc) = (letters_to_col(r.lookup_find.trim()), letters_to_col(r.lookup_return.trim()));
+            if fc > 0 && rc > 0 {
+                for row in 1..=ws.get_highest_row() {
+                    let k = clean(&ws.get_value((fc, row)));
+                    let v = clean(&ws.get_value((rc, row)));
+                    if !k.is_empty() && !v.is_empty() {
+                        table.entry(k.to_lowercase()).or_insert(v);
+                    }
+                }
+            }
+        }
+        out.insert(key, table);
+    }
+    out
 }
 
 fn scan_for(j: &Job, progress: &dyn Fn(String)) -> Vec<FileInfo> {
     progress("Scanning folder…".into());
     let skip: Vec<PathBuf> = j.sheet_path.iter().cloned().collect();
     let files = scan_folder(&j.folder, &j.scan, &skip, progress);
-    match j.row_mode {
+    match &j.row_mode {
         RowMode::Files => files,
         mode => folder_rows(&j.folder, &files, mode),
     }
@@ -1295,14 +1379,18 @@ pub fn run_job(j: &Job, progress: &dyn Fn(String)) -> Res<RunResult> {
     let hr = p.hr;
     let is_csv = p.is_csv;
     let all_cols: Vec<u32> = p.headers.iter().map(|(c, _)| *c).collect();
+    let fill_cols = data_cols(&p);
     let ws = p.book.ws_mut();
 
-    let template: Vec<(u32, umya::Style)> = if hr < ws.get_highest_row() {
+    let mut last = last_data_row(ws, hr, &fill_cols);
+    // new rows copy the look of the last row with data (not the header)
+    let template: Vec<(u32, umya::Style)> = if last > hr {
+        all_cols.iter().map(|c| (*c, ws.get_style((*c, last)).clone())).collect()
+    } else if hr < ws.get_highest_row() {
         all_cols.iter().map(|c| (*c, ws.get_style((*c, hr + 1)).clone())).collect()
     } else {
         vec![]
     };
-    let mut last = last_data_row(ws, hr, &all_cols);
     if files.is_empty() && last > hr && !j.fresh {
         bail!("No files were found in that folder (check the folder and the filters in section 1). Nothing was changed.");
     }
@@ -1319,7 +1407,7 @@ pub fn run_job(j: &Job, progress: &dyn Fn(String)) -> Res<RunResult> {
     }
     let mut existing = existing_rows(ws, hr, last, p.key.0);
     let mut indexer = Indexer::new(ws, hr, last, &p.plan);
-    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 } };
+    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 }, lookups: p.lookups.clone() };
     let (mut added, mut matched) = (0, 0);
     let (_kc, kf, kp) = p.key.clone();
 
@@ -1334,8 +1422,11 @@ pub fn run_job(j: &Job, progress: &dyn Fn(String)) -> Res<RunResult> {
             None => {
                 last += 1;
                 added += 1;
+                // keep rows that are already formatted (e.g. a pre-made template area)
                 for (c, st) in &template {
-                    ws.set_style((*c, last), st.clone());
+                    if ws.get_style((*c, last)) == &umya::Style::default() {
+                        ws.set_style((*c, last), st.clone());
+                    }
                 }
                 (last, true)
             }
@@ -1353,6 +1444,11 @@ pub fn run_job(j: &Job, progress: &dyn Fn(String)) -> Res<RunResult> {
                 continue;
             }
             let v = if f == "index" { indexer.next(*c) } else { field_value(f, prm, info, &ctx) };
+            // nothing found: leave the cell alone. A refresh never replaces
+            // something with nothing (e.g. an environment typed by hand)
+            if matches!(&v, Val::Text(t) if t.trim().is_empty()) {
+                continue;
+            }
             put(ws, *c, r, &v, is_csv);
         }
         if (i + 1) % 500 == 0 {
@@ -1431,6 +1527,8 @@ pub struct Preview {
     pub index_specs: Vec<Option<IndexSpec>>,
     /// the file or folder behind each row (for Show in Finder / Open)
     pub paths: Vec<PathBuf>,
+    /// lookup tables, so the column window can show looked-up results
+    pub lookups: Lookups,
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1440,7 +1538,8 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     let ws = p.book.ws();
     let use_sheet = !j.create_new && j.only_new;
     let all_cols: Vec<u32> = p.headers.iter().map(|(c, _)| *c).collect();
-    let last = if use_sheet { last_data_row(ws, p.hr, &all_cols) } else { p.hr };
+    let sheet_last = if j.create_new { p.hr } else { last_data_row(ws, p.hr, &data_cols(&p)) };
+    let last = if use_sheet { sheet_last } else { p.hr };
     let existing = if use_sheet { existing_rows(ws, p.hr, last, p.key.0) } else { HashMap::new() };
     let mut indexer = Indexer::new(ws, p.hr, last, &p.plan);
 
@@ -1451,7 +1550,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         .map(|c| header_of.get(&c).map(|h| h.to_string()).unwrap_or_else(|| format!("(column {})", col_letter(c))))
         .collect();
     let fields: HashMap<u32, (&String, &String)> = p.plan.iter().map(|(c, f, prm)| (*c, (f, prm))).collect();
-    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 } };
+    let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 }, lookups: p.lookups.clone() };
     let (_, kf, kp) = &p.key;
     let (mut rows, mut skipped, mut paths) = (Vec::new(), 0, Vec::new());
     for info in &files {
@@ -1474,9 +1573,11 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     Ok(Preview {
         letters: (lo..=hi).map(col_letter).collect(),
         filled: (lo..=hi).map(|c| fields.contains_key(&c)).collect(),
-        start_row: last + 1,
+        // rows go after the sheet's last row with data
+        start_row: sheet_last + 1,
         index_specs,
         paths,
+        lookups: p.lookups.clone(),
         samples: {
             let step = (files.len() / 60).max(1);
             files.iter().step_by(step).take(60).cloned().collect()
@@ -1682,13 +1783,13 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(by("link.exr"), Some((4000, 1)), "shortcuts are measured by what they point to");
 
-        let lvl = folder_rows(&root, &files, RowMode::FolderLevel(1));
+        let lvl = folder_rows(&root, &files, &RowMode::FolderLevel(1));
         let row = |rows: &[FileInfo], n: &str| rows.iter().find(|f| f.name == n).map(|f| (f.size, f.count, f.is_folder));
         assert_eq!(row(&lvl, "Shot_010"), Some((2050, 3, true)));
         assert_eq!(row(&lvl, "Shot_020"), Some((4000, 1, true)));
         assert_eq!(lvl.len(), 2, "files above level 1 (and packages) aren't folder rows: {:?}", lvl.iter().map(|f| &f.name).collect::<Vec<_>>());
 
-        let with = folder_rows(&root, &files, RowMode::FoldersWithFiles);
+        let with = folder_rows(&root, &files, &RowMode::FoldersWithFiles);
         let names: Vec<&str> = with.iter().map(|f| f.rel.as_str()).collect();
         assert!(names.contains(&"Shot_010") && names.contains(&"") , "{names:?}");
         let plates = with.iter().find(|f| f.rel == format!("Shot_010{}plates", std::path::MAIN_SEPARATOR)).unwrap();
@@ -1696,7 +1797,7 @@ mod tests {
         assert_eq!(plates.folders, vec!["Media".to_string(), "Shot_010".to_string()]);
 
         // GB / TB columns
-        let ctx = Ctx { delimiter: "_".into(), today: Local::now().date_naive(), base: 1000.0 };
+        let ctx = Ctx { delimiter: "_".into(), today: Local::now().date_naive(), base: 1000.0, lookups: Default::default() };
         let mut big = lvl[0].clone();
         big.size = 2_345_000_000_000;
         assert!(matches!(field_value("size_tb", "", &big, &ctx), Val::Num(v) if v == 2.345));
@@ -1723,6 +1824,8 @@ mod tests {
         assert_eq!(auto_field("Size (GB)"), "size_gb");
         assert_eq!(auto_field("Size TB"), "size_tb");
         assert_eq!(auto_field("File count"), "count");
+        assert_eq!(auto_field("Clip Count"), "count");
+        assert_eq!(auto_field("Card Size (GB)"), "size_gb");
         assert_eq!(auto_field("Folder"), "parent");
         assert_eq!(auto_field_for("Folder", true), "name");
         assert_eq!(auto_field_for("Folder Size", true), "size_h");
@@ -1743,5 +1846,74 @@ mod reveal_tests {
         } else {
             assert_eq!((cmd.as_str(), args[0].to_str()), ("xdg-open", Some("/a b")));
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_harness {
+    use super::*;
+
+    /// Load a saved setup the way the app does and build a job from it.
+    fn job_from_setup(s: &Settings, folder: &Path, sheet: &Path) -> Job {
+        let p = peek(sheet, Some(&s.sheet_name), Some(s.header_row)).expect("peek");
+        let mapping = p
+            .headers
+            .iter()
+            .map(|(c, h)| {
+                let (f, prm) = s.mapping.get(h).cloned().unwrap_or_else(|| {
+                    let f = auto_field_for(h, s.row_mode != "files");
+                    (f.to_string(), field(f).default.unwrap_or("").to_string())
+                });
+                MapEntry { col: *c, header: h.clone(), field: f, param: prm }
+            })
+            .collect();
+        Job {
+            folder: folder.to_path_buf(),
+            scan: std::sync::Arc::new(ScanOptions {
+                recursive: s.recursive,
+                skip_hidden: s.skip_hidden,
+                extensions: split_list(&s.extensions),
+                exclude: split_list(&s.exclude),
+            }),
+            sheet_path: Some(sheet.to_path_buf()),
+            create_new: false,
+            new_columns: vec![],
+            sheet_name: p.sheet,
+            header_row: s.header_row,
+            mapping,
+            key_header: s.key_header.clone(),
+            delimiter: s.delimiter.clone(),
+            fresh: false,
+            update_existing: s.update_existing,
+            backup: false,
+            only_new: s.only_new,
+            row_mode: RowMode::from_settings(&s.row_mode, s.folder_level, &s.folder_pattern),
+            size_base: s.size_base,
+        }
+    }
+
+    /// cargo test setup_harness -- --ignored --nocapture
+    /// with FT_SETUP, FT_FOLDER and FT_SHEET (a copy: it gets updated)
+    #[test]
+    #[ignore]
+    fn run_setup() {
+        let env = |k: &str| PathBuf::from(std::env::var(k).unwrap_or_else(|_| panic!("set {k}")));
+        let s = load_settings(&env("FT_SETUP")).expect("setup");
+        let (folder, sheet) = (env("FT_FOLDER"), env("FT_SHEET"));
+        let quiet = |_m: String| {};
+        let mut j = job_from_setup(&s, &folder, &sheet);
+        for (label, only_new) in [("NEW CARDS ONLY (what the grid shows)", true), ("ALL CARDS", false)] {
+            j.only_new = only_new;
+            let p = preview_job(&j, &quiet).expect("preview");
+            println!("\n=== {label}: {} rows, {} already in sheet, paste at row {}", p.rows.len(), p.skipped, p.start_row);
+            println!("{}", p.columns.iter().take(15).cloned().collect::<Vec<_>>().join(" | "));
+            for r in &p.rows {
+                println!("{}", r.iter().take(15).map(|c| c.1.as_str()).collect::<Vec<_>>().join(" | "));
+            }
+            println!("lookup tables: {:?}", p.lookups.values().map(|t| t.len()).collect::<Vec<_>>());
+        }
+        j.only_new = true;
+        let r = run_job(&j, &quiet).expect("run");
+        println!("\nUPDATE: added {}, matched {}, missing {}", r.added, r.matched, r.missing);
     }
 }

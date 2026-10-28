@@ -220,7 +220,25 @@ impl App {
                     .on_hover_text("1 = the folders directly inside the folder you scan");
                 ui.radio_value(&mut self.s.row_mode, "withfiles".into(), "each folder with files in it")
                     .on_hover_text("One row for every folder that holds files (e.g. image sequences), sized by its own files");
+                ui.radio_value(&mut self.s.row_mode, "pattern".into(), "folders named like")
+                    .on_hover_text("One row per folder whose name matches, at any depth (e.g. camera and sound cards), with the total of everything inside");
             });
+            if self.s.row_mode == "pattern" {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.s.folder_pattern).desired_width(140.0).font(egui::TextStyle::Monospace));
+                    if ui.small_button("starts with a date").on_hover_text("Folders like 20261025_BMUCI_… or 20261025_DAY02_…").clicked() {
+                        self.s.folder_pattern = DATE_FOLDER_PATTERN.into();
+                    }
+                    match regex::Regex::new(&self.s.folder_pattern) {
+                        Err(_) => {
+                            ui.colored_label(egui::Color32::from_rgb(220, 120, 80), "pattern problem");
+                        }
+                        Ok(_) => {
+                            ui.colored_label(HINT, "e.g. ^\\d{8}_ = names starting with 8 digits and _");
+                        }
+                    }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.s.recursive, "Include subfolders");
                 ui.checkbox(&mut self.s.skip_hidden, "Skip hidden & system files");
@@ -419,6 +437,9 @@ impl App {
             self.rename_buf = Some((i, self.rows[i].header.clone()));
         }
         let samples: &[FileInfo] = self.grid.data.as_ref().map(|d| d.samples.as_slice()).unwrap_or(&[]);
+        let empty = Lookups::new();
+        let lookups = self.grid.data.as_ref().map(|d| &d.lookups).unwrap_or(&empty);
+        let sheets: Vec<String> = if self.s.sheet_mode == "existing" { self.sheets.clone() } else { vec![] };
         let row = &mut self.rows[i];
         let before = (row.field.clone(), row.param.clone());
         let header = row.header.clone();
@@ -432,6 +453,8 @@ impl App {
             &mut row.param,
             samples,
             &mut self.edit_sample,
+            &sheets,
+            lookups,
         );
         let changed = (row.field.as_str(), row.param.as_str()) != (before.0.as_str(), before.1.as_str());
         if changed {

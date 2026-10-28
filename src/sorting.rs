@@ -113,6 +113,7 @@ mod tests {
             start_row: 5,
             samples: vec![],
             paths: vec![],
+            lookups: Default::default(),
             index_specs: vec![Some(IndexSpec { pre: "DOC-".into(), width: 3, suf: String::new(), first: 7, plain: false }), None],
         }
     }

@@ -448,7 +448,7 @@ impl App {
             update_existing: self.s.update_existing,
             backup: self.s.backup,
             only_new: self.s.only_new,
-            row_mode: RowMode::from_settings(&self.s.row_mode, self.s.folder_level),
+            row_mode: RowMode::from_settings(&self.s.row_mode, self.s.folder_level, &self.s.folder_pattern),
             size_base: self.s.size_base,
         }
     }
@@ -460,7 +460,7 @@ impl App {
             "{:?}",
             (
                 (s.folder.trim(), s.recursive, s.skip_hidden, &s.extensions, &s.exclude),
-                (&s.row_mode, s.folder_level, s.size_base),
+                (&s.row_mode, s.folder_level, &s.folder_pattern, s.size_base),
                 (&s.sheet_mode, s.sheet_path.trim(), &s.sheet_name, s.header_row),
                 (&s.key_header, &s.delimiter, s.only_new),
                 self.rows.iter().map(|r| (r.col, &r.header, &r.field, &r.param)).collect::<Vec<_>>(),

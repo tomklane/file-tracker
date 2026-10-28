@@ -81,9 +81,14 @@ The grid updates by itself when you change a setting or when files change.
 Click **Settings** in the top bar (or press ⌘, / Ctrl+,). It has collapsible
 sections:
 
-- **Folder & rows.** What each row is (a file, a folder at a level, or each
-  folder with files in it), subfolders, hidden files, file types, and names
-  to skip.
+- **Folder & rows.** What each row is: a file, a folder at a level, each
+  folder with files in it, or **folders named like** a pattern. The last is
+  ideal for camera and sound cards: `^\d{8}_` (the **starts with a date**
+  button) makes one row per folder named like `20261025_BMUCI_…` or
+  `20261025_DAY02_…`, at whatever depth it sits, sized by everything inside
+  it, including subfolders like DCIM. This section also covers subfolders,
+  hidden files, file types, and names to skip (folders such as
+  `09_EXPORTS`, or files such as `*.mhl`).
 - **Spreadsheet.** Your sheet's columns or your own, which sheet, the header
   row, and "only list files not yet in the sheet".
 - **Columns.** What fills each column. With your own columns you can also
@@ -92,8 +97,12 @@ sections:
   saved setups, and update checks.
 
 **Update spreadsheet** (or **Save as spreadsheet…** with your own columns)
-writes straight into a file instead of copying. New files are added at the
-bottom and existing rows are refreshed. Deleted files are flagged if you
+writes straight into a file instead of copying. New rows go right after the
+last row the app's columns have data in, so pre-filled checkboxes or status
+columns further down don't push them to the bottom. They keep any formatting
+those rows already have. Existing rows are refreshed, and a refresh never
+replaces something with nothing: a value typed by hand stays when the rule
+finds no value. Deleted files are flagged if you
 mapped a Present/Missing column. A backup goes into `_tracker_backups` first.
 
 ### Custom columns: any piece of a folder or file name
@@ -118,7 +127,12 @@ your folder:
    - **Text between markers.** For example, after `Rev` and before `_`.
    - **Pattern.** A regular expression, for anything else.
 3. **Tidy up.** Trim spaces, change case, or set text to use when nothing is
-   found.
+   found. You can also:
+   - **Turn into a date**, so `20261025` becomes a real date the spreadsheet
+     understands.
+   - **Look it up in sheet**, which swaps the result for a value from another
+     sheet of your spreadsheet. For example, find `JR1` in column B of
+     "Shooter List" and use column A to get `John Racine`.
 
 The result is shown highlighted, along with what the same rule gives for
 other files in your folder, so you can check it before using it. The grid

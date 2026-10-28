@@ -72,6 +72,14 @@ pub struct Rule {
     pub trim: bool,
     pub case: Case,
     pub if_empty: String,
+    /// read the result as a date (20261025, 2026-10-25, 2026_10_25 …)
+    pub as_date: bool,
+    /// swap the result for a value from another sheet, e.g. initials → name:
+    /// find it in column `lookup_find` of `lookup_sheet`, use column `lookup_return`
+    pub lookup: bool,
+    pub lookup_sheet: String,
+    pub lookup_find: String,
+    pub lookup_return: String,
 }
 
 impl Default for Rule {
@@ -93,6 +101,11 @@ impl Default for Rule {
             trim: true,
             case: Case::AsIs,
             if_empty: String::new(),
+            as_date: false,
+            lookup: false,
+            lookup_sheet: String::new(),
+            lookup_find: "B".into(),
+            lookup_return: "A".into(),
         }
     }
 }
@@ -105,12 +118,49 @@ pub fn to_param(r: &Rule) -> String {
     serde_json::to_string(r).unwrap_or_default()
 }
 
+impl Rule {
+    /// Which lookup table this rule needs, if any.
+    pub fn lookup_key(&self) -> Option<String> {
+        if self.lookup && !self.lookup_sheet.trim().is_empty() {
+            Some(format!(
+                "{}\u{1f}{}\u{1f}{}",
+                self.lookup_sheet.trim(),
+                self.lookup_find.trim().to_uppercase(),
+                self.lookup_return.trim().to_uppercase()
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Read text such as 20261025, 2026-10-25 or 2026_10_25 as a date.
+pub fn parse_date(t: &str) -> Option<chrono::NaiveDate> {
+    let t = t.trim();
+    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    let only_digits_and_seps = t.chars().all(|c| c.is_ascii_digit() || "-_./ ".contains(c));
+    if !only_digits_and_seps || digits.len() != 8 {
+        return None;
+    }
+    // year first (20261025 / 2026-10-25); otherwise day first (25.10.2026)
+    let (y, m, d) = if t.len() == 8 || t.chars().nth(4).map(|c| !c.is_ascii_digit()).unwrap_or(false) {
+        (&digits[0..4], &digits[4..6], &digits[6..8])
+    } else {
+        (&digits[4..8], &digits[2..4], &digits[0..2])
+    };
+    chrono::NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
+}
+
 /// The result of applying a rule, with the span (in characters) of the source
 /// text that was kept, so the app can highlight it.
 pub struct Extracted {
     pub source: String,
     pub span: Option<(usize, usize)>,
     pub text: String,
+    /// set when the rule reads the result as a date and it is one
+    pub date: Option<chrono::NaiveDate>,
+    /// the rule looks values up but this one wasn't in the table
+    pub lookup_missed: bool,
 }
 
 /// Folder by level: 0 = scanned folder, 1 = first subfolder, -1 = the file's own folder.
@@ -221,7 +271,13 @@ fn title_case(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub fn apply(r: &Rule, info: &FileInfo) -> Extracted {
+    apply_with(r, info, None)
+}
+
+/// Apply a rule, using a lookup table when the rule has one.
+pub fn apply_with(r: &Rule, info: &FileInfo, table: Option<&HashMap<String, String>>) -> Extracted {
     let source = source_text(r, info);
     let chars: Vec<char> = source.chars().collect();
     let n = chars.len();
@@ -278,6 +334,13 @@ pub fn apply(r: &Rule, info: &FileInfo) -> Extracted {
     if r.trim {
         text = text.trim().to_string();
     }
+    let mut lookup_missed = false;
+    if r.lookup && !text.is_empty() {
+        match table.and_then(|t| t.get(&text.trim().to_lowercase())) {
+            Some(v) => text = v.clone(),
+            None => lookup_missed = true, // keep what was found so it's visible
+        }
+    }
     text = match r.case {
         Case::AsIs => text,
         Case::Upper => text.to_uppercase(),
@@ -287,7 +350,11 @@ pub fn apply(r: &Rule, info: &FileInfo) -> Extracted {
     if text.is_empty() && !r.if_empty.is_empty() {
         text = r.if_empty.clone();
     }
-    Extracted { source, span, text }
+    let date = if r.as_date { parse_date(&text) } else { None };
+    if let Some(d) = date {
+        text = d.format("%Y-%m-%d").to_string();
+    }
+    Extracted { source, span, text, date, lookup_missed }
 }
 
 fn ordinal(k: i64) -> String {
@@ -434,6 +501,37 @@ mod tests {
         // unicode is counted in characters
         let r = Rule { method: Method::Chars, char_from: 1, char_len: 3, ..Default::default() };
         assert_eq!(get(&r, "a/Café_x.pdf"), "Caf");
+    }
+
+    #[test]
+    fn dates_and_lookups() {
+        assert_eq!(parse_date("20261025"), chrono::NaiveDate::from_ymd_opt(2026, 10, 25));
+        assert_eq!(parse_date("2026-10-25"), chrono::NaiveDate::from_ymd_opt(2026, 10, 25));
+        assert_eq!(parse_date("25.10.2026"), chrono::NaiveDate::from_ymd_opt(2026, 10, 25));
+        assert_eq!(parse_date("20261399"), None);
+        assert_eq!(parse_date("A003"), None);
+        let r = Rule { source: Source::Folder, level: -1, method: Method::Chars, char_from: 1, char_len: 8, as_date: true, ..Default::default() };
+        let e = apply(&r, &info("20261025_BMUCI_URSATOPSIDE_DAY02_JR1_A003/clip.braw"));
+        assert_eq!((e.text.as_str(), e.date), ("2026-10-25", chrono::NaiveDate::from_ymd_opt(2026, 10, 25)));
+
+        // initials -> name through a table read from another sheet
+        let mut t = HashMap::new();
+        t.insert("jr1".to_string(), "John Racine".to_string());
+        let r = Rule {
+            source: Source::Folder,
+            level: -1,
+            method: Method::Pattern,
+            pattern: r"_DAY\d+_([A-Z]+\d+)".into(),
+            lookup: true,
+            lookup_sheet: "Shooter List".into(),
+            ..Default::default()
+        };
+        let cam = info("20261025_BMUCI_URSATOPSIDE_DAY02_JR1_A003/clip.braw");
+        let snd = info("20261027_DAY04_MS2_LAV_COLIN_001/a.wav");
+        assert_eq!(apply_with(&r, &cam, Some(&t)).text, "John Racine");
+        let miss = apply_with(&r, &snd, Some(&t));
+        assert_eq!((miss.text.as_str(), miss.lookup_missed), ("MS2", true));
+        assert!(r.lookup_key().is_some());
     }
 
     #[test]

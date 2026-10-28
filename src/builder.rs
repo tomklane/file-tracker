@@ -1,7 +1,7 @@
 //! The column builder window: choose what fills a column, including picking
 //! a piece of any folder or file name by clicking it.
 
-use crate::core::{field, FileInfo, FIELDS};
+use crate::core::{field, FileInfo, Lookups, FIELDS};
 use crate::extract::{self, Case, Method, Rule, Source};
 use eframe::egui::{self, text::LayoutJob, Color32, RichText, TextFormat};
 
@@ -133,6 +133,8 @@ pub fn column_window(
     param: &mut String,
     samples: &[FileInfo],
     sample_idx: &mut usize,
+    sheets: &[String],
+    lookups: &Lookups,
 ) -> bool {
     let mut open = true;
     let mut done = false;
@@ -158,7 +160,7 @@ pub fn column_window(
                 });
                 if field_key == "extract" {
                     let mut rule = extract::parse(param);
-                    rule_editor(ui, &mut rule, samples, sample_idx);
+                    rule_editor(ui, &mut rule, samples, sample_idx, sheets, lookups);
                     let new = extract::to_param(&rule);
                     if new != *param {
                         *param = new;
@@ -197,7 +199,7 @@ pub fn column_window(
     true
 }
 
-fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx: &mut usize) {
+fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx: &mut usize, sheets: &[String], lookups: &Lookups) {
     let shift = ui.input(|i| i.modifiers.shift);
     if !samples.is_empty() {
         *sample_idx = (*sample_idx).min(samples.len() - 1);
@@ -433,16 +435,63 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
         ui.label("  If nothing is found, use:");
         ui.add(egui::TextEdit::singleline(&mut r.if_empty).desired_width(80.0).hint_text("blank"));
     });
+    ui.checkbox(&mut r.as_date, "Turn into a date (20261025 or 2026-10-25 → a real date the spreadsheet understands)");
+    ui.horizontal_wrapped(|ui| {
+        let can = !sheets.is_empty();
+        ui.add_enabled(can, egui::Checkbox::new(&mut r.lookup, "Look it up in sheet"))
+            .on_hover_text("Swap what was found for a value from another sheet, e.g. initials JR1 → John Racine")
+            .on_disabled_hover_text("Needs a spreadsheet with that sheet (choose one in the top bar)");
+        ui.add_enabled_ui(can && r.lookup, |ui| {
+            if r.lookup_sheet.is_empty() {
+                // a sensible first guess, e.g. a sheet of names
+                r.lookup_sheet = sheets
+                    .iter()
+                    .find(|s| {
+                        let l = s.to_lowercase();
+                        l.contains("shooter") || l.contains("crew") || l.contains("list")
+                    })
+                    .or(sheets.first())
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            egui::ComboBox::from_id_salt("lookup_sheet").width(150.0).selected_text(r.lookup_sheet.as_str()).show_ui(ui, |ui| {
+                for s in sheets {
+                    ui.selectable_value(&mut r.lookup_sheet, s.clone(), s);
+                }
+            });
+            ui.label("find it in column");
+            ui.add(egui::TextEdit::singleline(&mut r.lookup_find).desired_width(28.0));
+            ui.label("and use column");
+            ui.add(egui::TextEdit::singleline(&mut r.lookup_return).desired_width(28.0));
+        });
+    });
+    let table = r.lookup_key().and_then(|k| lookups.get(&k));
+    if r.lookup {
+        match table {
+            None => {
+                ui.colored_label(HINT, "The lookup table is read with the next grid update (in a moment).");
+            }
+            Some(t) if t.is_empty() => {
+                ui.colored_label(Color32::from_rgb(220, 120, 80), "Nothing found in that sheet and column — check the column letters.");
+            }
+            Some(t) => {
+                ui.colored_label(HINT, format!("{} entries in “{}”.", t.len(), r.lookup_sheet));
+            }
+        }
+    }
 
     // ---- results
     ui.add_space(10.0);
     ui.separator();
     let Some(s) = sample else { return };
-    let e = extract::apply(r, s);
+    let e = extract::apply_with(r, s, table);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Result:").strong());
         let shown = if e.text.is_empty() { "(nothing)".to_string() } else { e.text.clone() };
         ui.label(RichText::new(shown).monospace().size(17.0).strong().color(ui.visuals().strong_text_color()));
+        if e.lookup_missed && table.is_some() {
+            ui.colored_label(Color32::from_rgb(220, 120, 80), "not in the lookup sheet");
+        }
     });
     ui.horizontal_wrapped(|ui| {
         ui.colored_label(HINT, "from");
@@ -465,7 +514,7 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
         ui.colored_label(HINT, "Gives");
         ui.end_row();
         for idx in others {
-            let ex = extract::apply(r, &samples[idx]);
+            let ex = extract::apply_with(r, &samples[idx], table);
             let src = ui.add(egui::Label::new(highlighted(ui, &ex.source, ex.span, 12.0)).sense(egui::Sense::click()));
             let res = ui.add(
                 egui::Label::new(RichText::new(if ex.text.is_empty() { "(nothing)" } else { &ex.text }).monospace().strong())
