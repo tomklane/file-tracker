@@ -37,9 +37,15 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     (a.len() - i).cmp(&(b.len() - j))
 }
 
-/// The order to show rows in: indexes into `p.rows`.
-pub fn view_order(p: &Preview, sort_col: Option<usize>, descending: bool) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..p.rows.len()).collect();
+/// Does any cell in the row contain the filter text (ignoring case)?
+pub fn row_matches(p: &Preview, i: usize, filter_lower: &str) -> bool {
+    filter_lower.is_empty() || p.rows[i].iter().any(|(shown, _)| shown.to_lowercase().contains(filter_lower))
+}
+
+/// The order to show rows in: indexes into `p.rows`, filtered then sorted.
+pub fn view_order(p: &Preview, sort_col: Option<usize>, descending: bool, filter: &str) -> Vec<usize> {
+    let f = filter.trim().to_lowercase();
+    let mut order: Vec<usize> = (0..p.rows.len()).filter(|&i| row_matches(p, i, &f)).collect();
     let Some(c) = sort_col.filter(|c| *c < p.columns.len()) else { return order };
     if p.index_specs.get(c).map(|s| s.is_some()).unwrap_or(false) {
         // sorting by the running number = the order they were found in
@@ -106,6 +112,7 @@ mod tests {
             filled: vec![true, true],
             start_row: 5,
             samples: vec![],
+            paths: vec![],
             index_specs: vec![Some(IndexSpec { pre: "DOC-".into(), width: 3, suf: String::new(), first: 7, plain: false }), None],
         }
     }
@@ -113,18 +120,21 @@ mod tests {
     #[test]
     fn sort_and_renumber() {
         let p = preview(&[["DOC-007", "beta"], ["DOC-008", ""], ["DOC-009", "Alpha"], ["DOC-010", "gamma 10"], ["DOC-011", "gamma 9"]]);
-        let o = view_order(&p, Some(1), false);
+        let o = view_order(&p, Some(1), false, "");
         let names: Vec<String> = (0..o.len()).map(|r| cell(&p, &o, true, r, 1).0).collect();
         assert_eq!(names, ["Alpha", "beta", "gamma 9", "gamma 10", ""]);
         // running numbers follow the new order
         let ids: Vec<String> = (0..o.len()).map(|r| cell(&p, &o, true, r, 0).1).collect();
         assert_eq!(ids, ["DOC-007", "DOC-008", "DOC-009", "DOC-010", "DOC-011"]);
-        let o = view_order(&p, Some(1), true);
+        let o = view_order(&p, Some(1), true, "");
         let names: Vec<String> = (0..o.len()).map(|r| cell(&p, &o, true, r, 1).0).collect();
         assert_eq!(names, ["gamma 10", "gamma 9", "beta", "Alpha", ""], "empty still last");
         // sorting by the running number itself just reverses
-        let o = view_order(&p, Some(0), true);
+        let o = view_order(&p, Some(0), true, "");
         assert_eq!(cell(&p, &o, false, 0, 0).0, "DOC-011");
-        assert_eq!(view_order(&p, None, false), vec![0, 1, 2, 3, 4]);
+        assert_eq!(view_order(&p, None, false, ""), vec![0, 1, 2, 3, 4]);
+        // filtering keeps matching rows (any column, any case), then sorts them
+        assert_eq!(view_order(&p, Some(1), false, "GAMMA"), vec![4, 3]);
+        assert_eq!(view_order(&p, None, false, "doc-008"), vec![1]);
     }
 }

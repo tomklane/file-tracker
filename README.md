@@ -34,41 +34,67 @@ page instead.
 
 ## Using it
 
-Settings are on the left and the grid is on the right. The grid updates by
-itself whenever you change a setting or add, rename or delete files in the
-folder.
+1. **Choose a folder.** Click **📁** in the top bar, or drop a folder onto the
+   window. The grid fills straight away using standard columns.
+2. **Optionally choose your spreadsheet.** Click **📊** (or drop an `.xlsx`
+   or `.csv` onto the window) and the grid uses your sheet's own columns,
+   column letters and the row numbers new files will land on. Without one,
+   you use your own columns, which you can add, rename, move and delete.
+3. **Copy from the grid and paste into Excel, Numbers or Google Sheets.**
+   Drag across cells (or use Shift+arrows) and press ⌘C / Ctrl+C. **Copy all**
+   is in the top bar, and the status bar says which cell to paste at.
 
-1. **Folder to scan.** Choose the top folder. You can limit it to file types
-   (`pdf, docx`) or skip names (`*.tmp, Archive, Old*`).
-   **Each row is** a file, **a folder at a level** (e.g. level 1 = every
-   folder directly inside, such as each shot or project folder), or **each
-   folder with files in it** (e.g. every image-sequence folder, at whatever
-   depth). Folder rows are sized by adding up everything inside them, and
-   "Date modified" is the newest file inside.
-2. **Tracking spreadsheet.** Choose your existing tracker. The app finds the
-   header row itself, even below a title, and you can change it. Or choose
-   **Start from new columns** and type the column names you want.
-3. **What goes in each column.** Choose from: file name, folder, path,
-   clickable link, size (automatic units, or exactly in KB, MB, GB or TB),
-   number of files, dates, a running ID (`DOC-###`), Present/Missing,
-   fixed text, or **Custom** (below). Columns left on **leave as is** stay
-   blank in the grid and are never touched in your sheet.
-4. **Copy from the grid.** The grid shows your sheet's column letters and
-   the actual row numbers the files will land on. By default it lists only
-   files that aren't in your sheet yet.
-   - Drag across cells to select them. Shift-click extends the selection.
-     Click a column letter or a row number to take a whole column or row.
-     Ctrl/⌘+A selects everything.
-   - Press Ctrl+C or ⌘C (or click **Copy selection** or **Copy all rows**).
-   - The app tells you which cell to click in your sheet (e.g. "Paste at
-     cell A12"). Click it and paste.
-   - Tick **Include header row** to copy the column names too.
-   - **Sort** by any column with the small arrows on its heading: click once
-     for A→Z, again for Z→A, and a third time to go back to the order the
-     files were found in. Numbers inside text sort properly (`Rev2` before
-     `Rev10`), and empty cells always go last. Running numbers (`DOC-###`)
-     renumber to follow the sorted order, so what you paste stays in
-     sequence. The sort is remembered between runs.
+The grid updates by itself when you change a setting or when files change.
+
+### In the grid
+
+- **Right-click** a cell, a row number or a column heading for:
+  **Show in Finder** (File Explorer on Windows), **Open**, **Copy path**,
+  **Copy name**, **Copy with header row**, **Show only rows with this
+  value**, **Sort**, **Change column…**, **Leave this column blank**,
+  **Skip files/folders named…**, and (with your own columns)
+  **Insert / Move / Delete column**. Control-click works as a right-click
+  on a Mac.
+- **Filter.** Type in the filter box (⌘F / Ctrl+F) to show only rows
+  containing that text, in any column. Esc clears it.
+- **Sort** with the arrows on a heading: A→Z, Z→A, then back to folder order.
+  Numbers sort properly (`Rev2` before `Rev10`).
+- When sorting or filtering, running numbers (`DOC-###`) renumber to follow
+  what's shown, so a paste stays in sequence.
+- **Double-click a heading** to change what fills that column.
+
+| Keys (Mac / Windows) | Does |
+|---|---|
+| Arrows, Shift+arrows | Move / extend the selection (⌘/Ctrl+arrow jumps to the edge) |
+| ⌘C / Ctrl+C | Copy the selection |
+| ⇧⌘C / Ctrl+Shift+C | Copy all rows shown |
+| ⌘A / Ctrl+A | Select everything |
+| ⇧⌘R / Ctrl+Shift+R | Show the selected files in Finder / File Explorer |
+| ⌘O / Ctrl+O | Open the selected files |
+| ⌘F / Ctrl+F | Filter rows |
+| ⌘R / Ctrl+R or F5 | Scan again |
+| ⌘, / Ctrl+, | Show or hide the settings |
+| Esc | Clear the selection or the filter |
+
+### Settings
+
+Click **Settings** in the top bar (or press ⌘, / Ctrl+,). It has collapsible
+sections:
+
+- **Folder & rows.** What each row is (a file, a folder at a level, or each
+  folder with files in it), subfolders, hidden files, file types, and names
+  to skip.
+- **Spreadsheet.** Your sheet's columns or your own, which sheet, the header
+  row, and "only list files not yet in the sheet".
+- **Columns.** What fills each column. With your own columns you can also
+  add, rename, move (↑ ↓) and delete (🗑) them.
+- **Options.** Auto-update, size units, how **Update spreadsheet** behaves,
+  saved setups, and update checks.
+
+**Update spreadsheet** (or **Save as spreadsheet…** with your own columns)
+writes straight into a file instead of copying. New files are added at the
+bottom and existing rows are refreshed. Deleted files are flagged if you
+mapped a Present/Missing column. A backup goes into `_tracker_backups` first.
 
 ### Custom columns: any piece of a folder or file name
 

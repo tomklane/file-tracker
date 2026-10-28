@@ -123,10 +123,12 @@ fn step(ui: &mut egui::Ui, n: &str, title: &str) {
 }
 
 /// Shows the column window. Returns false once the user closes it.
+#[allow(clippy::too_many_arguments)]
 pub fn column_window(
     ctx: &egui::Context,
     letter: &str,
     header: &str,
+    name: Option<&mut String>,
     field_key: &mut String,
     param: &mut String,
     samples: &[FileInfo],
@@ -144,6 +146,12 @@ pub fn column_window(
         .default_pos(ctx.content_rect().min + egui::vec2(10.0, 50.0))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(ctx.content_rect().height() - 140.0).show(ui, |ui| {
+                if let Some(name) = name {
+                    ui.horizontal(|ui| {
+                        ui.label("Column name:");
+                        ui.add(egui::TextEdit::singleline(name).desired_width(220.0));
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label("Fill with:");
                     field_combo(ui, "colwin_field", 330.0, field_key, param);

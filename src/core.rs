@@ -114,6 +114,7 @@ pub struct Settings {
     /// what each row is: "files", "level" (folders at folder_level) or "withfiles"
     pub row_mode: String,
     pub folder_level: u32,
+    pub show_sidebar: bool,
     /// 1000 (like Finder) or 1024 (like Windows)
     pub size_base: u32,
     /// header text -> [field key, setting]
@@ -128,7 +129,7 @@ impl Default for Settings {
             skip_hidden: true,
             extensions: String::new(),
             exclude: String::new(),
-            sheet_mode: "existing".into(),
+            sheet_mode: "new".into(),
             sheet_path: String::new(),
             sheet_name: String::new(),
             header_row: 1,
@@ -147,6 +148,7 @@ impl Default for Settings {
             skip_version: String::new(),
             row_mode: "files".into(),
             folder_level: 1,
+            show_sidebar: true,
             size_base: default_size_base(),
             mapping: HashMap::new(),
         }
@@ -1427,6 +1429,8 @@ pub struct Preview {
     pub samples: Vec<FileInfo>,
     /// for running-number columns: how to renumber rows after sorting
     pub index_specs: Vec<Option<IndexSpec>>,
+    /// the file or folder behind each row (for Show in Finder / Open)
+    pub paths: Vec<PathBuf>,
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1449,7 +1453,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     let fields: HashMap<u32, (&String, &String)> = p.plan.iter().map(|(c, f, prm)| (*c, (f, prm))).collect();
     let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 } };
     let (_, kf, kp) = &p.key;
-    let (mut rows, mut skipped) = (Vec::new(), 0);
+    let (mut rows, mut skipped, mut paths) = (Vec::new(), 0, Vec::new());
     for info in &files {
         if !existing.is_empty() && existing.contains_key(&key_of(&field_value(kf, kp, info, &ctx), false)) {
             skipped += 1;
@@ -1465,12 +1469,14 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
             })
             .collect();
         rows.push(row);
+        paths.push(info.path.clone());
     }
     Ok(Preview {
         letters: (lo..=hi).map(col_letter).collect(),
         filled: (lo..=hi).map(|c| fields.contains_key(&c)).collect(),
         start_row: last + 1,
         index_specs,
+        paths,
         samples: {
             let step = (files.len() / 60).max(1);
             files.iter().step_by(step).take(60).cloned().collect()
@@ -1485,6 +1491,45 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
 
 pub fn open_path(p: &Path) {
     let _ = open::that_detached(p);
+}
+
+/// What the computer's file browser is called.
+pub fn file_manager_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(target_os = "windows") {
+        "File Explorer"
+    } else {
+        "file manager"
+    }
+}
+
+/// The command that shows (selects) a file in Finder / File Explorer.
+pub fn reveal_command(p: &Path) -> (String, Vec<std::ffi::OsString>) {
+    if cfg!(target_os = "macos") {
+        ("open".into(), vec!["-R".into(), p.as_os_str().to_owned()])
+    } else if cfg!(target_os = "windows") {
+        // explorer wants "/select," and the path as separate words
+        ("explorer".into(), vec!["/select,".into(), p.as_os_str().to_owned()])
+    } else {
+        let dir = p.parent().unwrap_or(p);
+        ("xdg-open".into(), vec![dir.as_os_str().to_owned()])
+    }
+}
+
+/// Show these files in Finder / File Explorer.
+pub fn reveal(paths: &[PathBuf]) {
+    for p in paths.iter().take(10) {
+        let (cmd, args) = reveal_command(p);
+        let mut c = std::process::Command::new(cmd);
+        c.args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000); // no console window
+        }
+        let _ = c.spawn();
+    }
 }
 
 #[cfg(test)]
@@ -1681,5 +1726,22 @@ mod tests {
         assert_eq!(auto_field("Folder"), "parent");
         assert_eq!(auto_field_for("Folder", true), "name");
         assert_eq!(auto_field_for("Folder Size", true), "size_h");
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+    #[test]
+    fn reveal_command_for_this_computer() {
+        let p = PathBuf::from("/a b/c.pdf");
+        let (cmd, args) = reveal_command(&p);
+        if cfg!(target_os = "macos") {
+            assert_eq!((cmd.as_str(), args.len()), ("open", 2));
+        } else if cfg!(target_os = "windows") {
+            assert_eq!((cmd.as_str(), args[0].to_str()), ("explorer", Some("/select,")));
+        } else {
+            assert_eq!((cmd.as_str(), args[0].to_str()), ("xdg-open", Some("/a b")));
+        }
     }
 }
