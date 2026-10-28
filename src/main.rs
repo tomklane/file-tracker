@@ -291,6 +291,10 @@ impl App {
         update::cleanup_after_update();
         app.apply_sheet_mode(true);
         app.last_row_mode = app.s.row_mode.clone();
+        #[cfg(debug_assertions)]
+        if let Ok(p) = std::env::var("FT_TEST_LOAD_SETUP") {
+            app.load_setup(Path::new(&p));
+        }
         if app.s.check_updates {
             app.check_for_updates(false);
         }
@@ -418,6 +422,12 @@ impl App {
                 s.show_sidebar = true;
                 self.s = s;
                 self.last_row_mode = self.s.row_mode.clone();
+                // forget the columns on screen first: re-reading the sheet's
+                // columns would otherwise save their old choices over the setup's
+                self.rows.clear();
+                self.editing = None;
+                self.rename_buf = None;
+                self.grid.sel = None;
                 self.apply_sheet_mode(true);
                 let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
                 self.status = format!("Loaded setup “{name}”.");
