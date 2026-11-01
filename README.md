@@ -46,6 +46,12 @@ page instead.
 
 The grid updates by itself when you change a setting or when files change.
 
+With your spreadsheet chosen, files that are **already in the sheet** stay in
+the grid, greyed and numbered with the row they're on, so you still see
+everything after **Update spreadsheet**. New files come after them, with
+green **+** row numbers showing where they'll land. **Copy N new** copies just
+the new rows. Click **Hide them** in the status bar to list only new files.
+
 ### In the grid
 
 - **Right-click** a cell, a row number or a column heading for:
@@ -90,7 +96,7 @@ sections:
   hidden files, file types, and names to skip (folders such as
   `09_EXPORTS`, or files such as `*.mhl`).
 - **Spreadsheet.** Your sheet's columns or your own, which sheet, the header
-  row, and "only list files not yet in the sheet".
+  row, and "hide files that are already in the sheet".
 - **Columns.** What fills each column. With your own columns you can also
   add, rename, move (↑ ↓) and delete (🗑) them.
 - **Options.** Auto-update, size units, how **Update spreadsheet** behaves,

@@ -2,7 +2,7 @@
 //! column window.
 
 use crate::core::*;
-use crate::{builder, update, Action, App, Upd, HINT};
+use crate::{builder, sorting, update, Action, App, Upd, HINT};
 use eframe::egui::{self, Align, Layout, RichText};
 use std::path::Path;
 use std::time::Duration;
@@ -130,10 +130,18 @@ impl App {
                     self.pending = Some(Action::Update);
                 }
                 let has_rows = !self.grid.order.is_empty();
-                let copy_label = if self.grid.sel.is_some() { "Copy selection" } else { "Copy all" };
+                let new = self.grid.ranks.iter().filter(|k| k.is_some()).count();
+                let mixed = new > 0 && new < self.grid.order.len();
+                let copy_label =
+                    if self.grid.sel.is_some() { "Copy selection".to_string() } else if mixed { format!("Copy {new} new") } else { "Copy all".to_string() };
+                let copy_tip = if mixed && self.grid.sel.is_none() {
+                    format!("Copy the rows that aren't in your sheet yet, to paste under its last row ({})", cmd_key("C"))
+                } else {
+                    format!("Copy to paste into a spreadsheet ({})", cmd_key("C"))
+                };
                 if ui
                     .add_enabled(has_rows, egui::Button::new(RichText::new(copy_label).strong()))
-                    .on_hover_text(format!("Copy to paste into a spreadsheet ({})", cmd_key("C")))
+                    .on_hover_text(copy_tip)
                     .clicked()
                 {
                     self.pending = Some(Action::Copy);
@@ -150,20 +158,34 @@ impl App {
         ui.horizontal(|ui| {
             if let Some(d) = &self.grid.data {
                 let noun = if self.s.row_mode == "files" { "file" } else { "folder" };
-                let total = d.rows.len();
+                let new = d.new_rows();
+                let total = if self.s.hide_in_sheet { new } else { d.rows.len() };
                 let shown = self.grid.order.len();
-                let mut t = if d.from_sheet && self.s.only_new {
-                    format!("{total} new {noun}{}", if total == 1 { "" } else { "s" })
+                let mut t = if d.from_sheet {
+                    format!("{new} new {noun}{}", if new == 1 { "" } else { "s" })
                 } else {
-                    format!("{total} {noun}{}", if total == 1 { "" } else { "s" })
+                    format!("{new} {noun}{}", if new == 1 { "" } else { "s" })
                 };
+                if d.skipped > 0 {
+                    t += &format!("  ·  {} already in the sheet", d.skipped);
+                    if !self.s.hide_in_sheet {
+                        t += " (greyed)";
+                    }
+                }
                 if shown != total {
                     t += &format!("  ·  showing {shown}");
                 }
-                if d.skipped > 0 {
-                    t += &format!("  ·  {} already in the sheet", d.skipped);
-                }
                 ui.label(t).on_hover_text(format!("{} items found in the folder", d.files));
+                if d.skipped > 0 {
+                    let (label, tip) = if self.s.hide_in_sheet {
+                        ("Show them", "List the files that are already in your sheet too, greyed, with the row they're on")
+                    } else {
+                        ("Hide them", "Only list files that aren't in your sheet yet")
+                    };
+                    if ui.small_button(label).on_hover_text(tip).clicked() {
+                        self.s.hide_in_sheet = !self.s.hide_in_sheet;
+                    }
+                }
             }
             if let Some(c) = self.sort_index() {
                 let name = self.grid.data.as_ref().map(|d| d.columns[c].clone()).unwrap_or_default();
@@ -184,12 +206,20 @@ impl App {
                 let hint = if !self.grid.copy_msg.is_empty() {
                     self.grid.copy_msg.clone()
                 } else if let (Some(d), false) = (&self.grid.data, self.grid.order.is_empty()) {
-                    let (r, c) = self.grid.sel.map(|s| (s.bounds().0, s.bounds().2)).unwrap_or((0, 0));
-                    format!(
-                        "Paste at cell {}{} · right-click for more",
-                        d.letters.get(c).cloned().unwrap_or_default(),
-                        d.start_row as usize + r
-                    )
+                    let letter = |c: usize| d.letters.get(c).cloned().unwrap_or_default();
+                    match self.grid.sel.map(|s| (s.bounds().0, s.bounds().2)) {
+                        Some((r, _)) if self.grid.ranks.get(r).copied().flatten().is_none() && d.from_sheet => format!(
+                            "Already in your sheet on row {} · right-click for more",
+                            sorting::row_number(d, &self.grid.order, &self.grid.ranks, r)
+                        ),
+                        Some((r, c)) => format!(
+                            "Paste at cell {}{} · right-click for more",
+                            letter(c),
+                            sorting::row_number(d, &self.grid.order, &self.grid.ranks, r)
+                        ),
+                        None if d.new_rows() > 0 => format!("Paste new rows at cell {}{} · right-click for more", letter(0), d.start_row),
+                        None => "Nothing new to paste · right-click for more".to_string(),
+                    }
                 } else {
                     String::new()
                 };
@@ -290,7 +320,9 @@ impl App {
                         self.pending = Some(Action::ReloadColumns(false));
                     }
                 });
-                ui.checkbox(&mut self.s.only_new, "Only list files that aren't in the sheet yet");
+                ui.checkbox(&mut self.s.hide_in_sheet, "Hide files that are already in the sheet").on_hover_text(
+                    "Otherwise they're listed greyed, with the row they're on, above the new ones",
+                );
             } else {
                 ui.colored_label(HINT, "Add, rename and arrange your columns below, or right-click a column heading in the grid.");
             }
@@ -570,7 +602,7 @@ impl eframe::App for App {
         self.global_keys(&ctx);
         self.grid_keys(&ctx);
         self.handle_drops(&ctx);
-        if self.filter != self.filter_applied {
+        if self.filter != self.filter_applied || self.s.hide_in_sheet != self.hide_applied {
             self.rebuild_order();
         }
         if let Some(a) = self.pending.take() {

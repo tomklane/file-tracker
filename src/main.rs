@@ -149,6 +149,8 @@ struct Grid {
     hits: Vec<(Rect, Hit)>,
     /// display order of the rows (indexes into data.rows), after sorting
     order: Vec<usize>,
+    /// for each shown row, its place among the shown new rows (None = already in the sheet)
+    ranks: Vec<Option<usize>>,
 }
 
 struct App {
@@ -173,6 +175,8 @@ struct App {
     /// text in the filter box: only rows containing it are shown
     filter: String,
     filter_applied: String,
+    /// the hide_in_sheet setting the shown order was built with
+    hide_applied: bool,
     menu: Option<GridMenu>,
     /// scroll the grid to show this row next frame
     scroll_to: Option<usize>,
@@ -271,6 +275,7 @@ impl App {
                 copy_msg: String::new(),
                 hits: vec![],
                 order: vec![],
+                ranks: vec![],
             },
             watchers: vec![],
             watch_key: String::new(),
@@ -283,6 +288,7 @@ impl App {
             last_row_mode: String::new(),
             filter: String::new(),
             filter_applied: String::new(),
+            hide_applied: false,
             menu: None,
             scroll_to: None,
             pending: None,
@@ -486,7 +492,6 @@ impl App {
             fresh: !create_new && self.s.run_mode == "fresh",
             update_existing: self.s.update_existing,
             backup: self.s.backup,
-            only_new: self.s.only_new,
             row_mode: RowMode::from_settings(&self.s.row_mode, self.s.folder_level, &self.s.folder_pattern),
             size_base: self.s.size_base,
         }
@@ -501,7 +506,7 @@ impl App {
                 (s.folder.trim(), s.recursive, s.skip_hidden, &s.extensions, &s.exclude),
                 (&s.row_mode, s.folder_level, &s.folder_pattern, s.size_base),
                 (&s.sheet_mode, s.sheet_path.trim(), &s.sheet_name, s.header_row),
-                (&s.key_header, &s.delimiter, s.only_new),
+                (&s.key_header, &s.delimiter),
                 self.rows.iter().map(|r| (r.col, &r.header, &r.field, &r.param)).collect::<Vec<_>>(),
             )
         )
@@ -689,8 +694,13 @@ impl App {
     fn rebuild_order(&mut self) {
         let sc = self.sort_index();
         self.filter_applied = self.filter.clone();
+        self.hide_applied = self.s.hide_in_sheet;
         self.grid.order = match &self.grid.data {
-            Some(d) => sorting::view_order(d, sc, self.s.sort_desc, &self.filter),
+            Some(d) => sorting::view_order(d, sc, self.s.sort_desc, &self.filter, self.s.hide_in_sheet),
+            None => vec![],
+        };
+        self.grid.ranks = match &self.grid.data {
+            Some(d) => sorting::ranks(d, &self.grid.order),
             None => vec![],
         };
         if let Some(sel) = self.grid.sel {
@@ -919,22 +929,39 @@ impl App {
     // ------------------------------------------------------------ copy
 
     fn copy_range(&mut self, r0: usize, r1: usize, c0: usize, c1: usize) {
+        self.copy_rows(&(r0..=r1).collect::<Vec<_>>(), c0, c1);
+    }
+
+    /// Copy shown rows `rows` (display positions, in order), columns c0..=c1.
+    fn copy_rows(&mut self, rows: &[usize], c0: usize, c1: usize) {
         let Some(d) = &self.grid.data else { return };
+        let Some(&first) = rows.first() else { return };
         let mut lines = Vec::new();
         if self.s.copy_headers {
             lines.push(d.columns[c0..=c1].join("\t"));
         }
         let renumber = self.renumber();
-        for r in r0..=r1 {
-            let cells: Vec<String> = (c0..=c1).map(|c| sorting::cell(d, &self.grid.order, renumber, r, c).1).collect();
+        let (order, ranks) = (&self.grid.order, &self.grid.ranks);
+        for &r in rows {
+            let cells: Vec<String> = (c0..=c1).map(|c| sorting::cell(d, order, ranks, renumber, r, c).1).collect();
             lines.push(cells.join("\t"));
         }
         self.ctx.copy_text(lines.join("\n"));
-        let (nr, nc) = (r1 - r0 + 1, c1 - c0 + 1);
+        let (nr, nc) = (rows.len(), c1 - c0 + 1);
+        let old = rows.iter().filter(|&&r| ranks.get(r).copied().flatten().is_none()).count();
+        let row = sorting::row_number(d, order, ranks, first);
         let target = if self.s.copy_headers {
             "Paste into the top-left cell of an empty sheet".to_string()
+        } else if old == nr {
+            format!("These rows are already in your sheet (from row {row})")
+        } else if old > 0 {
+            format!(
+                "Click cell {}{row} and paste with {}. {old} of them are already in your sheet, so check before pasting",
+                d.letters[c0],
+                paste_keys()
+            )
         } else {
-            format!("Click cell {}{} in your sheet and paste with {}", d.letters[c0], d.start_row as usize + r0, paste_keys())
+            format!("Click cell {}{row} in your sheet and paste with {}", d.letters[c0], paste_keys())
         };
         self.grid.copy_msg = format!(
             "Copied {nr} row{} × {nc} column{}. {target}.",
@@ -943,6 +970,14 @@ impl App {
         );
     }
 
+    /// Shown rows that aren't in the sheet yet (display positions).
+    fn shown_new_rows(&self) -> Vec<usize> {
+        self.grid.ranks.iter().enumerate().filter(|(_, k)| k.is_some()).map(|(r, _)| r).collect()
+    }
+
+    /// "Copy all" copies the new rows when rows already in the sheet are
+    /// shown too, so the paste never duplicates them. With nothing new, it
+    /// copies everything shown.
     fn copy_all(&mut self) {
         let Some(d) = &self.grid.data else { return };
         let nr = self.shown_rows();
@@ -951,8 +986,16 @@ impl App {
             return;
         }
         let nc = d.columns.len();
-        self.grid.sel = Some(Sel { a: (0, 0), b: (nr - 1, nc - 1) });
-        self.copy_range(0, nr - 1, 0, nc - 1);
+        let new = self.shown_new_rows();
+        if new.is_empty() || new.len() == nr {
+            self.grid.sel = Some(Sel { a: (0, 0), b: (nr - 1, nc - 1) });
+            self.copy_range(0, nr - 1, 0, nc - 1);
+            return;
+        }
+        let (a, b) = (new[0], new[new.len() - 1]);
+        self.grid.sel = if b - a + 1 == new.len() { Some(Sel { a: (a, 0), b: (b, nc - 1) }) } else { None };
+        self.copy_rows(&new, 0, nc - 1);
+        self.grid.copy_msg = self.grid.copy_msg.replacen("Copied ", "Copied the new rows: ", 1);
     }
 
     fn copy_selection(&mut self) {

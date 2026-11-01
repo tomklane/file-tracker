@@ -102,7 +102,8 @@ pub struct Settings {
     pub run_mode: String, // "update" | "fresh"
     pub update_existing: bool,
     pub backup: bool,
-    pub only_new: bool,
+    /// hide rows for files that are already in the sheet (they're shown greyed otherwise)
+    pub hide_in_sheet: bool,
     pub auto_refresh: bool,
     pub copy_headers: bool,
     /// grid sort: column heading ("" = not sorted) and direction
@@ -141,7 +142,7 @@ impl Default for Settings {
             run_mode: "update".into(),
             update_existing: true,
             backup: true,
-            only_new: true,
+            hide_in_sheet: false,
             auto_refresh: true,
             copy_headers: false,
             sort_col: String::new(),
@@ -1192,7 +1193,6 @@ pub struct Job {
     pub fresh: bool,
     pub update_existing: bool,
     pub backup: bool,
-    pub only_new: bool,
     pub row_mode: RowMode,
     pub size_base: u32,
 }
@@ -1549,6 +1549,15 @@ pub struct Preview {
     pub paths: Vec<PathBuf>,
     /// lookup tables, so the column window can show looked-up results
     pub lookups: Lookups,
+    /// for each row: the sheet row it's already on, or None for a new one.
+    /// Rows already in the sheet come first, in sheet order, then new rows.
+    pub in_sheet: Vec<Option<u32>>,
+}
+
+impl Preview {
+    pub fn new_rows(&self) -> usize {
+        self.in_sheet.iter().filter(|r| r.is_none()).count()
+    }
 }
 
 /// Scan and lay the files out in the spreadsheet's column order. Nothing is saved.
@@ -1556,7 +1565,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     let p = prepare(j, progress)?;
     let files = scan_for(j, progress);
     let ws = p.book.ws();
-    let use_sheet = !j.create_new && j.only_new;
+    let use_sheet = !j.create_new;
     let all_cols: Vec<u32> = p.headers.iter().map(|(c, _)| *c).collect();
     let sheet_last = if j.create_new { p.hr } else { last_data_row(ws, p.hr, &data_cols(&p)) };
     let last = if use_sheet { sheet_last } else { p.hr };
@@ -1572,23 +1581,58 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
     let fields: HashMap<u32, (&String, &String)> = p.plan.iter().map(|(c, f, prm)| (*c, (f, prm))).collect();
     let ctx = Ctx { delimiter: j.delimiter.clone(), today: Local::now().date_naive(), base: if j.size_base == 1024 { 1024.0 } else { 1000.0 }, lookups: p.lookups.clone() };
     let (_, kf, kp) = &p.key;
-    let (mut rows, mut skipped, mut paths) = (Vec::new(), 0, Vec::new());
+    let sheet_text = |c: u32, r: u32| {
+        let v = ws.get_formatted_value((c, r));
+        let v = if v.trim().is_empty() { ws.get_value((c, r)) } else { v };
+        let v = clean(&v);
+        (v.clone(), v)
+    };
+    // (sheet row, cells, path) for rows already in the sheet; (cells, path) for new ones
+    type Cells = Vec<(String, String)>;
+    let mut have: Vec<(u32, Cells, PathBuf)> = Vec::new();
+    let mut fresh: Vec<(Cells, PathBuf)> = Vec::new();
     for info in &files {
-        if !existing.is_empty() && existing.contains_key(&key_of(&field_value(kf, kp, info, &ctx), false)) {
-            skipped += 1;
-            continue;
-        }
+        let at = existing.get(&key_of(&field_value(kf, kp, info, &ctx), false)).and_then(|v| v.first().copied());
         let row = (lo..=hi)
-            .map(|c| match fields.get(&c) {
-                None => (String::new(), String::new()),
-                Some((f, prm)) => {
+            .map(|c| match (fields.get(&c), at) {
+                // already in the sheet: show what the row will hold after an update
+                // (a refresh never replaces something with nothing)
+                (None, Some(r)) => sheet_text(c, r),
+                (Some((f, _)), Some(r)) if f.as_str() == "index" => sheet_text(c, r),
+                (Some((f, prm)), Some(r)) => {
+                    let v = cell_text(&field_value(f, prm, info, &ctx));
+                    if v.0.trim().is_empty() {
+                        sheet_text(c, r)
+                    } else {
+                        v
+                    }
+                }
+                (None, None) => (String::new(), String::new()),
+                (Some((f, prm)), None) => {
                     let v = if f.as_str() == "index" { indexer.next(c) } else { field_value(f, prm, info, &ctx) };
                     cell_text(&v)
                 }
             })
             .collect();
+        match at {
+            Some(r) => have.push((r, row, info.path.clone())),
+            None => fresh.push((row, info.path.clone())),
+        }
+    }
+    have.sort_by_key(|h| h.0);
+    let skipped = have.len();
+    let mut rows = Vec::with_capacity(have.len() + fresh.len());
+    let mut paths = Vec::with_capacity(rows.capacity());
+    let mut in_sheet = Vec::with_capacity(rows.capacity());
+    for (r, row, path) in have {
         rows.push(row);
-        paths.push(info.path.clone());
+        paths.push(path);
+        in_sheet.push(Some(r));
+    }
+    for (row, path) in fresh {
+        rows.push(row);
+        paths.push(path);
+        in_sheet.push(None);
     }
     Ok(Preview {
         letters: (lo..=hi).map(col_letter).collect(),
@@ -1607,6 +1651,7 @@ pub fn preview_job(j: &Job, progress: &dyn Fn(String)) -> Res<Preview> {
         files: files.len(),
         skipped,
         from_sheet: !j.create_new,
+        in_sheet,
     })
 }
 
@@ -1677,7 +1722,6 @@ mod tests {
             fresh: false,
             update_existing: true,
             backup: true,
-            only_new: true,
             row_mode: RowMode::Files,
             size_base: 1024,
         }
@@ -1732,7 +1776,11 @@ mod tests {
         let r2 = run_job(&j, &quiet).unwrap();
         assert_eq!((r2.added, r2.matched), (0, 6), "re-run must not duplicate");
         let pv2 = preview_job(&j, &quiet).unwrap();
-        assert_eq!((pv2.rows.len(), pv2.skipped), (0, 6));
+        // after an update the rows stay in the grid, marked with their sheet rows
+        assert_eq!((pv2.rows.len(), pv2.skipped), (6, 6));
+        assert!(pv2.in_sheet.iter().all(|r| r.is_some()));
+        assert!(pv2.in_sheet.windows(2).all(|w| w[0] < w[1]), "in sheet order");
+        assert!(pv2.rows.iter().all(|r| r.iter().any(|c| !c.0.is_empty())));
 
         fs::remove_file(dir.join("Project Alpha/readme.txt")).unwrap();
         fs::write(dir.join("Project Alpha/Specs/PRJ001_New-Item_RevA.xlsx"), vec![b'y'; 5000]).unwrap();
@@ -1925,7 +1973,6 @@ mod setup_harness {
             fresh: false,
             update_existing: s.update_existing,
             backup: false,
-            only_new: s.only_new,
             row_mode: RowMode::from_settings(&s.row_mode, s.folder_level, &s.folder_pattern),
             size_base: s.size_base,
         }
@@ -1940,19 +1987,20 @@ mod setup_harness {
         let s = load_settings(&env("FT_SETUP")).expect("setup");
         let (folder, sheet) = (env("FT_FOLDER"), env("FT_SHEET"));
         let quiet = |_m: String| {};
-        let mut j = job_from_setup(&s, &folder, &sheet);
-        for (label, only_new) in [("NEW CARDS ONLY (what the grid shows)", true), ("ALL CARDS", false)] {
-            j.only_new = only_new;
-            let p = preview_job(&j, &quiet).expect("preview");
+        let j = job_from_setup(&s, &folder, &sheet);
+        let show = |label: &str, j: &Job| {
+            let p = preview_job(j, &quiet).expect("preview");
             println!("\n=== {label}: {} rows, {} already in sheet, paste at row {}", p.rows.len(), p.skipped, p.start_row);
             println!("{}", p.columns.iter().take(15).cloned().collect::<Vec<_>>().join(" | "));
-            for r in &p.rows {
-                println!("{}", r.iter().take(15).map(|c| c.1.as_str()).collect::<Vec<_>>().join(" | "));
+            for (r, at) in p.rows.iter().zip(&p.in_sheet) {
+                let tag = at.map(|n| format!("[row {n}]")).unwrap_or_else(|| "[new]".into());
+                println!("{tag} {}", r.iter().take(15).map(|c| c.1.as_str()).collect::<Vec<_>>().join(" | "));
             }
             println!("lookup tables: {:?}", p.lookups.values().map(|t| t.len()).collect::<Vec<_>>());
-        }
-        j.only_new = true;
+        };
+        show("BEFORE UPDATE", &j);
         let r = run_job(&j, &quiet).expect("run");
         println!("\nUPDATE: added {}, matched {}, missing {}", r.added, r.matched, r.missing);
+        show("AFTER UPDATE", &j);
     }
 }

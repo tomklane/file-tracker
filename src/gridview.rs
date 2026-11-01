@@ -92,7 +92,7 @@ impl App {
                     format!("No rows contain “{}”.", self.filter.trim())
                 } else if d.skipped > 0 {
                     format!(
-                        "Everything in the folder is already in your sheet ({} items).\nNew files will appear here automatically.",
+                        "Everything in the folder is already in your sheet ({} items), and those rows are hidden.\nNew files will appear here automatically.",
                         d.skipped
                     )
                 } else {
@@ -101,6 +101,8 @@ impl App {
                 ui.label(RichText::new(msg).size(16.0).color(HINT));
                 if !self.filter.trim().is_empty() && ui.button("Clear the filter").clicked() {
                     self.filter.clear();
+                } else if self.filter.trim().is_empty() && d.skipped > 0 && self.s.hide_in_sheet && ui.button("Show them").clicked() {
+                    self.s.hide_in_sheet = false;
                 }
             });
             return;
@@ -113,11 +115,15 @@ impl App {
         let sort_desc = self.s.sort_desc;
         let renumber = self.renumber();
         let order = &self.grid.order;
+        let ranks = &self.grid.ranks;
         let visuals = ui.visuals().clone();
         let sel_fill = visuals.selection.bg_fill.gamma_multiply(0.45);
         let head_fill = visuals.faint_bg_color.gamma_multiply(1.6);
         let head_sel_fill = visuals.selection.bg_fill.gamma_multiply(0.7);
         let blank_fill = visuals.extreme_bg_color.gamma_multiply(0.6);
+        // rows already in the sheet are greyed; new rows' numbers stand out
+        let old_text = visuals.text_color().gamma_multiply(0.55);
+        let new_num = Color32::from_rgb(70, 160, 95);
         let line = Stroke::new(0.5, visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.8));
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
 
@@ -202,16 +208,32 @@ impl App {
                     body.rows(ROW_H, nrows, |mut row| {
                         let i = row.index();
                         let row_sel = sel.map(|s| s.has_row(i)).unwrap_or(false);
+                        let is_new = ranks.get(i).copied().flatten().is_some();
+                        let num = sorting::row_number(d, order, ranks, i);
                         row.col(|ui| {
                             let r = paint_cell(ui, Some(if row_sel { head_sel_fill } else { head_fill }));
                             hits.push((r, Hit::Row(i)));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.add_space(6.0);
-                                ui.label(RichText::new((d.start_row as usize + i).to_string()).small().color(HINT));
+                                let (t, col) = if !d.from_sheet {
+                                    (num.to_string(), HINT)
+                                } else if is_new {
+                                    (format!("+ {num}"), new_num)
+                                } else {
+                                    (num.to_string(), HINT)
+                                };
+                                let l = ui.add(egui::Label::new(RichText::new(t).small().color(col)).selectable(false));
+                                if d.from_sheet {
+                                    l.on_hover_text(if is_new {
+                                        format!("New: not in your sheet yet. Pastes onto row {num}.")
+                                    } else {
+                                        format!("Already in your sheet, on row {num}")
+                                    });
+                                }
                             });
                         });
                         for c in 0..ncols {
-                            let (shown, _) = sorting::cell(d, order, renumber, i, c);
+                            let (shown, _) = sorting::cell(d, order, ranks, renumber, i, c);
                             row.col(|ui| {
                                 let fill = if sel.map(|s| s.contains(i, c)).unwrap_or(false) {
                                     Some(sel_fill)
@@ -223,7 +245,8 @@ impl App {
                                 let r = paint_cell(ui, fill);
                                 hits.push((r, Hit::Cell(i, c)));
                                 ui.add_space(5.0);
-                                ui.add(egui::Label::new(shown.as_str()).selectable(false).truncate());
+                                let text = if is_new { RichText::new(shown.as_str()) } else { RichText::new(shown.as_str()).color(old_text) };
+                                ui.add(egui::Label::new(text).selectable(false).truncate());
                             });
                         }
                     });
@@ -430,7 +453,7 @@ impl App {
         let folder_rows = self.s.row_mode != "files";
         // the column and value under the pointer
         let (col, value) = match target {
-            Hit::Cell(r, c) => (Some(c), Some(sorting::cell(d, &self.grid.order, self.renumber(), r, c).0)),
+            Hit::Cell(r, c) => (Some(c), Some(sorting::cell(d, &self.grid.order, &self.grid.ranks, self.renumber(), r, c).0)),
             Hit::Col(c) => (Some(c), None),
             _ => (None, None),
         };
