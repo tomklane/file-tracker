@@ -29,6 +29,7 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            self.setups_menu(ui);
             // where the files come from
             let folder = file_name_of(&self.s.folder);
             let folder_label = if folder.is_empty() { "Choose a folder…".to_string() } else { folder };
@@ -65,10 +66,6 @@ impl App {
                 }
                 if self.s.sheet_mode != "new" && ui.button("Start from new columns instead").clicked() {
                     self.pending = Some(Action::UseNewColumns);
-                    ui.close();
-                }
-                if ui.button("Load a saved setup…").on_hover_text("Or drag a setup file onto the window").clicked() {
-                    self.pending = Some(Action::LoadSetup);
                     ui.close();
                 }
                 if self.s.sheet_mode == "existing" && Path::new(self.s.sheet_path.trim()).is_file() {
@@ -149,6 +146,123 @@ impl App {
             });
         });
         ui.add_space(4.0);
+    }
+
+    // ------------------------------------------------------------ setups
+
+    /// The setups menu at the left of the top bar: switch between the setups
+    /// kept in the app, and save, rename, import or export them.
+    fn setups_menu(&mut self, ui: &mut egui::Ui) {
+        let active = self.s.active_setup.clone();
+        let label = if active.is_empty() { "Setups".to_string() } else { active.clone() };
+        let resp = ui.menu_button(RichText::new(format!("🗂  {label}  ▾")).strong(), |ui| {
+            ui.set_min_width(260.0);
+            if self.setups.is_empty() {
+                ui.label(RichText::new("No setups in the app yet.").color(HINT));
+                ui.label(RichText::new("Save this one, or import a .json file.").color(HINT));
+            } else {
+                ui.label(RichText::new("Switch to").color(HINT));
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for n in self.setups.clone() {
+                        if ui.radio(n == active, &n).clicked() {
+                            if n != active {
+                                self.pending = Some(Action::SwitchSetup(n));
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            if ui.button("Save as a new setup…").on_hover_text("Keep these settings in the app under a name").clicked() {
+                self.pending = Some(Action::NewSetup);
+                ui.close();
+            }
+            if !active.is_empty() {
+                if ui.button(format!("Rename “{active}”…")).clicked() {
+                    self.pending = Some(Action::RenameSetup);
+                    ui.close();
+                }
+                if ui.button(format!("Delete “{active}”…")).clicked() {
+                    self.pending = Some(Action::DeleteSetup);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Import a setup file…").on_hover_text("Adds a .json setup to the app (or drag one onto the window)").clicked() {
+                self.pending = Some(Action::ImportSetup);
+                ui.close();
+            }
+            if ui.button("Export to a file…").on_hover_text("Save this setup as a .json file to share or back up").clicked() {
+                self.pending = Some(Action::ExportSetup);
+                ui.close();
+            }
+            if ui.button("Show the setups folder").clicked() {
+                self.pending = Some(Action::ShowSetups);
+                ui.close();
+            }
+            if !active.is_empty() {
+                ui.add_space(2.0);
+                ui.label(RichText::new(format!("Changes are saved to “{active}” as you go.")).small().color(HINT));
+            }
+        });
+        if resp.response.clicked() {
+            self.refresh_setups(); // pick up setups added in another window
+        }
+        resp.response.on_hover_text(if active.is_empty() {
+            "Setups kept in the app: folder, spreadsheet, columns and options, one per project".to_string()
+        } else {
+            format!("Using the setup “{active}”. Changes are saved to it as you go.")
+        });
+        ui.colored_label(HINT, "·");
+    }
+
+    /// The small box that asks for a setup's name.
+    fn setup_name_window(&mut self, ctx: &egui::Context) {
+        let Some(mut p) = self.name_prompt.take() else { return };
+        let mut open = true;
+        let mut done = false;
+        let title = if p.rename { "Rename this setup" } else { "Save as a new setup" };
+        egui::Window::new(title)
+            .id(egui::Id::unique("setup_name_window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Name:");
+                let edit = ui.add(egui::TextEdit::singleline(&mut p.text).hint_text("e.g. Timor Immersive").desired_width(280.0));
+                if p.focus {
+                    edit.request_focus();
+                    p.focus = false;
+                }
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if !p.rename {
+                    ui.label(
+                        RichText::new("Keeps the folder, spreadsheet, columns and options. Changes are saved to it as you go.")
+                            .small()
+                            .color(HINT),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let ok = !clean_setup_name(&p.text).is_empty();
+                    if (ui.add_enabled(ok, egui::Button::new(if p.rename { "Rename" } else { "Save" })).clicked() || (enter && ok))
+                        && self.name_setup(p.rename, &p.text)
+                    {
+                        done = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = true;
+        }
+        if open && !done {
+            self.name_prompt = Some(p);
+        }
     }
 
     // ------------------------------------------------------------ status bar
@@ -436,12 +550,16 @@ impl App {
             ui.checkbox(&mut self.s.update_existing, "Refresh details of files already listed");
             ui.checkbox(&mut self.s.backup, "Back up the spreadsheet first");
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save setup…").on_hover_text("Keep these settings in a file, e.g. one per project").clicked() {
-                    self.pending = Some(Action::SaveSetup);
+            ui.label(RichText::new("Setups (also in the menu at the top left):").color(HINT));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Save as a new setup…").on_hover_text("Keep these settings in the app under a name, e.g. one per project").clicked() {
+                    self.pending = Some(Action::NewSetup);
                 }
-                if ui.button("Load setup…").on_hover_text("Or drag a setup file onto the window").clicked() {
-                    self.pending = Some(Action::LoadSetup);
+                if ui.button("Import a setup file…").on_hover_text("Or drag a setup file onto the window").clicked() {
+                    self.pending = Some(Action::ImportSetup);
+                }
+                if ui.button("Export to a file…").on_hover_text("Save this setup as a .json file to share or back up").clicked() {
+                    self.pending = Some(Action::ExportSetup);
                 }
             });
             ui.add_space(6.0);
@@ -566,8 +684,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if ui.input(|i| i.viewport().close_requested()) {
-            self.remember_mapping();
-            save_settings(&self.s, &settings_file());
+            self.persist();
         }
 
         if self.show_update_bar() {
@@ -598,6 +715,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.grid_view(ui));
 
         self.column_window(&ctx);
+        self.setup_name_window(&ctx);
         self.grid_menu(&ctx);
         self.global_keys(&ctx);
         self.grid_keys(&ctx);
@@ -611,5 +729,6 @@ impl eframe::App for App {
         self.update_watchers();
         self.follow_row_mode();
         self.schedule_grid();
+        self.autosave();
     }
 }

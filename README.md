@@ -52,6 +52,27 @@ everything after **Update spreadsheet**. New files come after them, with
 green **+** row numbers showing where they'll land. **Copy N new** copies just
 the new rows. Click **Hide them** in the status bar to list only new files.
 
+### Setups
+
+A setup is everything for one project: the folder, the spreadsheet, what
+fills each column, and the options. Setups live in the app, in the **🗂
+menu** at the top left:
+
+- **Switch** between setups with one click.
+- **Save as a new setup…** keeps the current settings under a name.
+- **Changes save as you go.** While a setup is selected, anything you change
+  is saved to it automatically, so there's nothing to remember.
+- **Import a setup file…** adds a `.json` setup to the app. You can also drop
+  one onto the window. You only need to do this once: after that it's in the
+  menu.
+- **Export to a file…** saves a setup as `.json` to share or back up.
+- **Rename** and **Delete** do what they say. **Show the setups folder** opens
+  the folder where the app keeps them (`.file_tracker_setups` in your home
+  folder).
+
+A setup with no folder or spreadsheet in it (like one shared by someone
+else) uses the ones already chosen.
+
 ### In the grid
 
 - **Right-click** a cell, a row number or a column heading for:
@@ -100,7 +121,7 @@ sections:
 - **Columns.** What fills each column. With your own columns you can also
   add, rename, move (↑ ↓) and delete (🗑) them.
 - **Options.** Auto-update, size units, how **Update spreadsheet** behaves,
-  saved setups, and update checks.
+  setups, and update checks.
 
 **Update spreadsheet** (or **Save as spreadsheet…** with your own columns)
 writes straight into a file instead of copying. New rows go right after the
@@ -153,8 +174,8 @@ added at the bottom and existing rows are refreshed. Deleted files are
 flagged if you mapped a Present/Missing column. A backup goes into
 `_tracker_backups` first.
 
-Your setup is remembered between runs. Use **Save setup…** and
-**Load setup…** to keep one setup per project.
+Your settings are remembered between runs. To keep one setup per project,
+use the **🗂 setups menu** (see **Setups** above).
 
 ### Good to know
 

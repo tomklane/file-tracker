@@ -122,6 +122,9 @@ pub struct Settings {
     pub size_base: u32,
     /// header text -> [field key, setting]
     pub mapping: HashMap<String, (String, String)>,
+    /// the setup in the app's setups library these settings belong to ("" = none);
+    /// changes are saved back to it as you go
+    pub active_setup: String,
 }
 
 impl Default for Settings {
@@ -155,6 +158,7 @@ impl Default for Settings {
             show_sidebar: true,
             size_base: default_size_base(),
             mapping: HashMap::new(),
+            active_setup: String::new(),
         }
     }
 }
@@ -191,6 +195,83 @@ pub fn save_settings(s: &Settings, path: &Path) {
     if let Ok(txt) = serde_json::to_string_pretty(s) {
         let _ = fs::write(path, txt);
     }
+}
+
+// ------------------------------------------------------------------ setups library
+
+/// Where the app keeps its setups: one .json file per setup.
+pub fn setups_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".file_tracker_setups")
+}
+
+/// A setup name that works as a file name on Mac and Windows.
+pub fn clean_setup_name(name: &str) -> String {
+    let n: String = name.chars().map(|c| if "/\\:*?\"<>|".contains(c) || c.is_control() { '-' } else { c }).collect();
+    let n = clean(&n);
+    let n = n.trim_matches(|c: char| c == '.' || c == ' ').to_string();
+    n.chars().take(80).collect()
+}
+
+/// A name for a setup file being imported: "Timor Immersive - File Tracker
+/// setup.json" becomes "Timor Immersive".
+pub fn setup_name_from_file(path: &Path) -> String {
+    let mut n = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    for ext in [".txt", ".json", ".json"] {
+        if n.to_lowercase().ends_with(ext) {
+            n.truncate(n.len() - ext.len());
+        }
+    }
+    let lower = n.to_lowercase();
+    for tail in ["file tracker setup", "file-tracker setup", "setup"] {
+        if lower.ends_with(tail) && lower.len() > tail.len() {
+            n.truncate(n.len() - tail.len());
+            n = n.trim_end_matches([' ', '-', '_', '–', '(', ')']).to_string();
+            break;
+        }
+    }
+    let n = clean_setup_name(&n);
+    if n.is_empty() { "Imported setup".into() } else { n }
+}
+
+pub fn setup_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.json", clean_setup_name(name)))
+}
+
+/// The setups in the library, in natural order.
+pub fn list_setups(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let is_json = p.extension().map(|x| x.eq_ignore_ascii_case("json")).unwrap_or(false);
+                    (is_json && p.is_file()).then(|| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|a, b| crate::sorting::natural_cmp(a, b));
+    v
+}
+
+/// Write a setup into the library (creating the folder if needed).
+pub fn write_setup(dir: &Path, name: &str, s: &Settings) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("Couldn't create the setups folder ({e})."))?;
+    let p = setup_path(dir, name);
+    let mut s = s.clone();
+    s.active_setup = clean_setup_name(name);
+    let txt = serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?;
+    fs::write(&p, txt).map_err(|e| format!("Couldn't save the setup ({e})."))?;
+    Ok(p)
+}
+
+/// A name not used yet: "Timor", "Timor 2", "Timor 3"…
+pub fn unused_setup_name(dir: &Path, name: &str) -> String {
+    let base = clean_setup_name(name);
+    if !setup_path(dir, &base).exists() {
+        return base;
+    }
+    (2..).map(|n| format!("{base} {n}")).find(|n| !setup_path(dir, n).exists()).unwrap()
 }
 
 // ------------------------------------------------------------------ small helpers
@@ -1976,6 +2057,30 @@ mod setup_harness {
             row_mode: RowMode::from_settings(&s.row_mode, s.folder_level, &s.folder_pattern),
             size_base: s.size_base,
         }
+    }
+
+    #[test]
+    fn setups_library() {
+        let dir = std::env::temp_dir().join(format!("ft_setups_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(list_setups(&dir).is_empty());
+        assert_eq!(setup_name_from_file(Path::new("/x/Timor Immersive - File Tracker setup.json")), "Timor Immersive");
+        assert_eq!(setup_name_from_file(Path::new("/x/timor_setup.json")), "timor");
+        assert_eq!(setup_name_from_file(Path::new("/x/Job 12.json.txt")), "Job 12");
+        assert_eq!(setup_name_from_file(Path::new("/x/setup.json")), "setup");
+        assert_eq!(clean_setup_name(" a/b:c?  d. "), "a-b-c- d");
+        let mut s = Settings { key_header: "CAMERA FOLDER NAME".into(), ..Default::default() };
+        let p = write_setup(&dir, "Job 10", &s).unwrap();
+        write_setup(&dir, "Job 9", &s).unwrap();
+        assert_eq!(list_setups(&dir), ["Job 9", "Job 10"]);
+        let back = read_setup(&p).unwrap();
+        assert_eq!((back.key_header.as_str(), back.active_setup.as_str()), ("CAMERA FOLDER NAME", "Job 10"));
+        assert_eq!(unused_setup_name(&dir, "Job 9"), "Job 9 2");
+        assert_eq!(unused_setup_name(&dir, "Job 11"), "Job 11");
+        s.key_header = "X".into();
+        write_setup(&dir, "Job 9", &s).unwrap();
+        assert_eq!(read_setup(&setup_path(&dir, "Job 9")).unwrap().key_header, "X");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// cargo test setup_harness -- --ignored --nocapture

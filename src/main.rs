@@ -117,12 +117,24 @@ enum Action {
     ReloadColumns(bool),
     ApplySheetMode,
     UseNewColumns,
-    SaveSetup,
-    LoadSetup,
+    /// ask for a name and save the current settings as a new setup
+    NewSetup,
+    RenameSetup,
+    DeleteSetup,
+    ImportSetup,
+    ExportSetup,
+    SwitchSetup(String),
+    ShowSetups,
     OpenSheet,
     Update,
     Refresh,
     Copy,
+}
+
+pub(crate) struct NamePrompt {
+    pub rename: bool,
+    pub text: String,
+    pub focus: bool,
 }
 
 /// The right-click menu on the grid.
@@ -184,6 +196,13 @@ struct App {
     pending: Option<Action>,
     /// the column name being typed in the column window: (column, text)
     rename_buf: Option<(usize, String)>,
+    /// names of the setups in the app's library
+    setups: Vec<String>,
+    /// the settings as last written to disk, to save only when something changed
+    saved_txt: String,
+    autosave_check: Instant,
+    /// the "name this setup" box: (renaming?, text, focus it next frame)
+    name_prompt: Option<NamePrompt>,
 }
 
 fn alert(text: &str) {
@@ -293,13 +312,21 @@ impl App {
             scroll_to: None,
             pending: None,
             rename_buf: None,
+            setups: vec![],
+            saved_txt: String::new(),
+            autosave_check: Instant::now(),
+            name_prompt: None,
         };
         update::cleanup_after_update();
+        app.refresh_setups();
+        if !app.s.active_setup.is_empty() && !app.setups.contains(&app.s.active_setup) {
+            app.s.active_setup.clear(); // its file was removed
+        }
         app.apply_sheet_mode(true);
         app.last_row_mode = app.s.row_mode.clone();
         #[cfg(debug_assertions)]
         if let Ok(p) = std::env::var("FT_TEST_LOAD_SETUP") {
-            app.load_setup(Path::new(&p));
+            app.import_setup(Path::new(&p));
         }
         if app.s.check_updates {
             app.check_for_updates(false);
@@ -416,9 +443,13 @@ impl App {
 
     /// Load a saved setup. A setup without a folder or spreadsheet keeps the
     /// ones already chosen, so a shared setup can be dropped onto any project.
-    fn load_setup(&mut self, f: &Path) {
+    fn load_setup(&mut self, f: &Path, library_name: Option<&str>) {
         match read_setup(f) {
             Ok(mut s) => {
+                // app preferences aren't part of a setup
+                s.check_updates = self.s.check_updates;
+                s.skip_version = self.s.skip_version.clone();
+                s.active_setup = library_name.unwrap_or_default().to_string();
                 if s.folder.trim().is_empty() {
                     s.folder = self.s.folder.clone();
                 }
@@ -435,7 +466,7 @@ impl App {
                 self.rename_buf = None;
                 self.grid.sel = None;
                 self.apply_sheet_mode(true);
-                let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let name = library_name.map(str::to_string).unwrap_or_else(|| f.file_name().unwrap_or_default().to_string_lossy().to_string());
                 self.status = format!("Loaded setup “{name}”.");
                 self.grid.copy_msg = if self.s.folder.trim().is_empty() || (self.s.sheet_mode == "existing" && self.s.sheet_path.trim().is_empty()) {
                     format!("Loaded “{name}”. Now choose the folder (📁) and spreadsheet (📊) in the top bar.")
@@ -447,11 +478,119 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ setups library
+
+    pub(crate) fn refresh_setups(&mut self) {
+        self.setups = list_setups(&setups_dir());
+    }
+
+    /// Save the settings, and the setup they belong to, if anything changed.
+    fn persist(&mut self) {
+        self.remember_mapping();
+        let Ok(txt) = serde_json::to_string_pretty(&self.s) else { return };
+        if txt == self.saved_txt {
+            return;
+        }
+        let _ = std::fs::write(settings_file(), &txt);
+        if !self.s.active_setup.is_empty() {
+            if setup_path(&setups_dir(), &self.s.active_setup).is_file() {
+                if let Err(e) = write_setup(&setups_dir(), &self.s.active_setup.clone(), &self.s) {
+                    self.status = e;
+                }
+            } else {
+                self.s.active_setup.clear(); // removed outside the app
+            }
+        }
+        self.saved_txt = txt;
+    }
+
+    /// Called every frame: keeps the settings and the active setup saved as you go.
+    pub(crate) fn autosave(&mut self) {
+        if self.autosave_check.elapsed() >= Duration::from_millis(1500) {
+            self.autosave_check = Instant::now();
+            self.persist();
+        }
+    }
+
+    /// Switch to a setup from the library.
+    fn switch_setup(&mut self, name: &str) {
+        let p = setup_path(&setups_dir(), name);
+        if !p.is_file() {
+            self.refresh_setups();
+            error(&format!("The setup “{name}” isn't in the app any more."));
+            return;
+        }
+        self.persist(); // keep the changes made to the one being left
+        self.load_setup(&p, Some(name));
+        self.persist();
+    }
+
+    /// Copy a setup file into the app's library and switch to it.
+    fn import_setup(&mut self, f: &Path) {
+        let s = match read_setup(f) {
+            Ok(s) => s,
+            Err(e) => return error(&e),
+        };
+        let dir = setups_dir();
+        let mut name = setup_name_from_file(f);
+        if setup_path(&dir, &name).is_file()
+            && !ask(&format!("A setup called “{name}” is already in the app.\n\nReplace it with this file? (No keeps both.)"))
+        {
+            name = unused_setup_name(&dir, &name);
+        }
+        if let Err(e) = write_setup(&dir, &name, &s) {
+            return error(&e);
+        }
+        self.refresh_setups();
+        self.switch_setup(&name);
+        self.grid.copy_msg = format!("“{name}” is now saved in the app: pick it from the setups menu at the top left any time.");
+    }
+
+    /// The name box's Save button: a new setup, or a new name for the current one.
+    pub(crate) fn name_setup(&mut self, rename: bool, raw: &str) -> bool {
+        let dir = setups_dir();
+        let name = clean_setup_name(raw);
+        if name.is_empty() {
+            return false;
+        }
+        let old = self.s.active_setup.clone();
+        let taken = setup_path(&dir, &name).is_file() && !(rename && name.eq_ignore_ascii_case(&old));
+        if taken && !ask(&format!("There's already a setup called “{name}”. Replace it?")) {
+            return false;
+        }
+        self.persist();
+        if rename && !old.is_empty() {
+            let _ = std::fs::remove_file(setup_path(&dir, &old));
+        }
+        self.s.active_setup = name.clone();
+        if let Err(e) = write_setup(&dir, &name, &self.s) {
+            error(&e);
+            return false;
+        }
+        self.saved_txt.clear();
+        self.persist();
+        self.refresh_setups();
+        self.status = if rename { format!("Renamed the setup to “{name}”.") } else { format!("Saved as “{name}”. Changes are saved to it as you go.") };
+        true
+    }
+
+    fn delete_setup(&mut self) {
+        let name = self.s.active_setup.clone();
+        if name.is_empty() || !ask(&format!("Delete the setup “{name}” from the app?\n\nThe folder and spreadsheet aren't touched.")) {
+            return;
+        }
+        let _ = std::fs::remove_file(setup_path(&setups_dir(), &name));
+        self.s.active_setup.clear();
+        self.persist();
+        self.refresh_setups();
+        self.status = format!("Deleted the setup “{name}”.");
+    }
+
     /// A folder, spreadsheet or saved setup dropped onto the window.
     fn dropped(&mut self, paths: Vec<PathBuf>) {
         for p in paths {
             if p.is_file() && is_setup_file(&p) {
-                self.load_setup(&p);
+                self.import_setup(&p);
             } else if p.is_dir() {
                 self.s.folder = p.display().to_string();
             } else if matches!(
@@ -767,8 +906,7 @@ impl App {
     }
 
     fn start_update(&mut self, rel: update::Release) {
-        self.remember_mapping();
-        save_settings(&self.s, &settings_file());
+        self.persist();
         self.upd = Upd::Downloading { rel: rel.clone(), got: 0, total: rel.asset_size };
         let (tx, rx) = mpsc::channel();
         self.upd_rx = Some(rx);
@@ -813,8 +951,7 @@ impl App {
                     done = true;
                     match res {
                         Ok(target) => {
-                            self.remember_mapping();
-                            save_settings(&self.s, &settings_file());
+                            self.persist();
                             update::relaunch(&target);
                         }
                         Err(msg) => {
@@ -1209,23 +1346,35 @@ impl App {
                 self.apply_sheet_mode(false);
             }
             Action::ApplySheetMode => self.apply_sheet_mode(false),
-            Action::SaveSetup => {
-                self.remember_mapping();
+            Action::NewSetup => self.name_prompt = Some(NamePrompt { rename: false, text: String::new(), focus: true }),
+            Action::RenameSetup if !self.s.active_setup.is_empty() => {
+                self.name_prompt = Some(NamePrompt { rename: true, text: self.s.active_setup.clone(), focus: true });
+            }
+            Action::RenameSetup => {}
+            Action::DeleteSetup => self.delete_setup(),
+            Action::ImportSetup => {
+                // no file-type filter: downloaded setups sometimes get a different ending
+                if let Some(f) = FileDialog::new().set_title("Import a setup file").pick_file() {
+                    self.import_setup(&f);
+                }
+            }
+            Action::ExportSetup => {
+                self.persist();
+                let name = if self.s.active_setup.is_empty() { "File Tracker setup".to_string() } else { self.s.active_setup.clone() };
                 if let Some(f) = FileDialog::new()
-                    .set_title("Save this setup")
-                    .set_file_name("My file tracker setup.json")
+                    .set_title("Export this setup to a file")
+                    .set_file_name(format!("{name}.json"))
                     .add_filter("File Tracker setup", &["json"])
                     .save_file()
                 {
                     save_settings(&self.s, &f);
-                    self.status = format!("Setup saved to {}.", f.file_name().unwrap_or_default().to_string_lossy());
+                    self.status = format!("Setup exported to {}.", f.file_name().unwrap_or_default().to_string_lossy());
                 }
             }
-            Action::LoadSetup => {
-                // no file-type filter: downloaded setups sometimes get a different ending
-                if let Some(f) = FileDialog::new().set_title("Load a saved setup").pick_file() {
-                    self.load_setup(&f);
-                }
+            Action::SwitchSetup(name) => self.switch_setup(&name),
+            Action::ShowSetups => {
+                let _ = std::fs::create_dir_all(setups_dir());
+                open_path(&setups_dir());
             }
             Action::OpenSheet => {
                 let p = Path::new(&self.s.sheet_path);
@@ -1291,8 +1440,7 @@ impl App {
             p
         };
 
-        self.remember_mapping();
-        save_settings(&self.s, &settings_file());
+        self.persist();
         let job = self.make_job(Some(sheet_path), create_new);
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
@@ -1338,7 +1486,7 @@ impl App {
                     self.remember_mapping();
                     self.apply_sheet_mode(true);
                 }
-                save_settings(&self.s, &settings_file());
+                self.persist();
                 self.grid.refresh_at = Some(Instant::now());
                 let name = r.path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let mut lines = vec![format!("{} files scanned.", r.files), format!("• {} new file(s) added", r.added)];
