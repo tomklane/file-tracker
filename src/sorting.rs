@@ -98,6 +98,9 @@ pub fn ranks(p: &Preview, order: &[usize]) -> Vec<Option<usize>> {
 /// The spreadsheet row a shown row is on (already in the sheet) or lands on
 /// when the new rows are pasted in the shown order.
 pub fn row_number(p: &Preview, order: &[usize], ranks: &[Option<usize>], r: usize) -> u32 {
+    if !p.from_sheet {
+        return r as u32 + 1; // no spreadsheet: just count the rows
+    }
     match p.in_sheet.get(order[r]).copied().flatten() {
         Some(n) => n,
         None => p.start_row + ranks.get(r).copied().flatten().unwrap_or(r) as u32,

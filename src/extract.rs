@@ -80,6 +80,27 @@ pub struct Rule {
     pub lookup_sheet: String,
     pub lookup_find: String,
     pub lookup_return: String,
+    /// swap the result using a list typed into the rule, one "JR1 = John Racine"
+    /// per line (works without a spreadsheet)
+    pub replace: bool,
+    pub replace_list: String,
+}
+
+/// Find `text` in a "from = to" list (one pair per line, ignoring case).
+pub fn list_get(list: &str, text: &str) -> Option<String> {
+    let want = text.trim().to_lowercase();
+    list_pairs(list).into_iter().find(|(k, _)| k.to_lowercase() == want).map(|(_, v)| v)
+}
+
+/// The pairs in a "from = to" list. A tab works instead of "=".
+pub fn list_pairs(list: &str) -> Vec<(String, String)> {
+    list.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=').or_else(|| l.split_once('\t'))?;
+            let (k, v) = (k.trim(), v.trim());
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 impl Default for Rule {
@@ -106,6 +127,8 @@ impl Default for Rule {
             lookup_sheet: String::new(),
             lookup_find: "B".into(),
             lookup_return: "A".into(),
+            replace: false,
+            replace_list: String::new(),
         }
     }
 }
@@ -335,9 +358,11 @@ pub fn apply_with(r: &Rule, info: &FileInfo, table: Option<&HashMap<String, Stri
         text = text.trim().to_string();
     }
     let mut lookup_missed = false;
-    if r.lookup && !text.is_empty() {
-        match table.and_then(|t| t.get(&text.trim().to_lowercase())) {
-            Some(v) => text = v.clone(),
+    if (r.lookup || r.replace) && !text.is_empty() {
+        let from_sheet = if r.lookup { table.and_then(|t| t.get(&text.trim().to_lowercase())).cloned() } else { None };
+        let found = from_sheet.or_else(|| if r.replace { list_get(&r.replace_list, &text) } else { None });
+        match found {
+            Some(v) => text = v,
             None => lookup_missed = true, // keep what was found so it's visible
         }
     }
@@ -532,6 +557,14 @@ mod tests {
         let miss = apply_with(&r, &snd, Some(&t));
         assert_eq!((miss.text.as_str(), miss.lookup_missed), ("MS2", true));
         assert!(r.lookup_key().is_some());
+
+        // the same with a list typed into the rule: no spreadsheet needed
+        let r = Rule { lookup: false, replace: true, replace_list: "JR1 = John Racine\nms2\tMyles Storey\n\nnot a pair".into(), ..r };
+        assert_eq!(apply_with(&r, &cam, None).text, "John Racine");
+        assert_eq!(apply_with(&r, &snd, None).text, "Myles Storey");
+        let other = apply_with(&r, &info("20261027_DAY04_XY9_LAV_001/a.wav"), None);
+        assert_eq!((other.text.as_str(), other.lookup_missed), ("XY9", true));
+        assert_eq!(list_pairs("a=b\n = x\nc = d = e").len(), 2);
     }
 
     #[test]

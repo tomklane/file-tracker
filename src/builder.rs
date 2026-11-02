@@ -440,7 +440,7 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
         let can = !sheets.is_empty();
         ui.add_enabled(can, egui::Checkbox::new(&mut r.lookup, "Look it up in sheet"))
             .on_hover_text("Swap what was found for a value from another sheet, e.g. initials JR1 → John Racine")
-            .on_disabled_hover_text("Needs a spreadsheet with that sheet (choose one in the top bar)");
+            .on_disabled_hover_text("Needs a spreadsheet with that sheet. Without one, use “Replace using a list” below.");
         ui.add_enabled_ui(can && r.lookup, |ui| {
             if r.lookup_sheet.is_empty() {
                 // a sensible first guess, e.g. a sheet of names
@@ -465,6 +465,22 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
             ui.add(egui::TextEdit::singleline(&mut r.lookup_return).desired_width(28.0));
         });
     });
+    ui.checkbox(&mut r.replace, "Replace using a list").on_hover_text(
+        "Swap what was found using pairs typed here, e.g. JR1 = John Racine. Works without a spreadsheet.",
+    );
+    if r.replace {
+        ui.add(
+            egui::TextEdit::multiline(&mut r.replace_list)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .hint_text("JR1 = John Racine\nMS2 = Myles Storey"),
+        );
+        let n = extract::list_pairs(&r.replace_list).len();
+        ui.colored_label(
+            HINT,
+            format!("{n} pair{}. One per line: what was found = what to show.", if n == 1 { "" } else { "s" }),
+        );
+    }
     let table = r.lookup_key().and_then(|k| lookups.get(&k));
     if r.lookup {
         match table {
@@ -489,8 +505,13 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut Rule, samples: &[FileInfo], sample_idx
         ui.label(RichText::new("Result:").strong());
         let shown = if e.text.is_empty() { "(nothing)".to_string() } else { e.text.clone() };
         ui.label(RichText::new(shown).monospace().size(17.0).strong().color(ui.visuals().strong_text_color()));
-        if e.lookup_missed && table.is_some() {
-            ui.colored_label(Color32::from_rgb(220, 120, 80), "not in the lookup sheet");
+        if e.lookup_missed && (table.is_some() || r.replace) {
+            let msg = match (table.is_some(), r.replace) {
+                (true, true) => "not in the lookup sheet or the list",
+                (true, false) => "not in the lookup sheet",
+                _ => "not in the list",
+            };
+            ui.colored_label(Color32::from_rgb(220, 120, 80), msg);
         }
     });
     ui.horizontal_wrapped(|ui| {

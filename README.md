@@ -73,6 +73,15 @@ menu** at the top left:
 A setup with no folder or spreadsheet in it (like one shared by someone
 else) uses the ones already chosen.
 
+### No spreadsheet needed
+
+To get the grid from the folder alone, with your tracker's columns, choose
+**Use these columns without the spreadsheet** in the 📊 menu (or **Use my own
+columns** under Settings › Spreadsheet). The columns, their order and what
+fills them stay the same. Lookups in other sheets (like initials → names) are
+copied into the column as a list, so nothing needs the file any more. Then
+copy from the grid and paste into your sheet.
+
 ### In the grid
 
 - **Right-click** a cell, a row number or a column heading for:
@@ -160,6 +169,8 @@ your folder:
    - **Look it up in sheet**, which swaps the result for a value from another
      sheet of your spreadsheet. For example, find `JR1` in column B of
      "Shooter List" and use column A to get `John Racine`.
+   - **Replace using a list**, which does the same with pairs typed into the
+     column, one per line (`JR1 = John Racine`). It needs no spreadsheet.
 
 The result is shown highlighted, along with what the same rule gives for
 other files in your folder, so you can check it before using it. The grid

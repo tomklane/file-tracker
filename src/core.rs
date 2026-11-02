@@ -225,7 +225,7 @@ pub fn setup_name_from_file(path: &Path) -> String {
     for tail in ["file tracker setup", "file-tracker setup", "setup"] {
         if lower.ends_with(tail) && lower.len() > tail.len() {
             n.truncate(n.len() - tail.len());
-            n = n.trim_end_matches([' ', '-', '_', '–', '(', ')']).to_string();
+            n = n.trim_end_matches([' ', '-', '_', '–']).to_string();
             break;
         }
     }
@@ -1332,6 +1332,27 @@ fn prepare(j: &Job, progress: &dyn Fn(String)) -> Res<Prepared> {
 
 /// Read the tables that custom rules look values up in (e.g. initials → name
 /// from a "Shooter List" sheet). Missing sheets just give empty tables.
+/// The (find, return) pairs a lookup reads from another sheet, as written
+/// there, so a rule can carry them when the spreadsheet is left behind.
+pub fn read_lookup_pairs(path: &Path, sheet: &str, find: &str, ret: &str) -> Vec<(String, String)> {
+    let Ok(b) = load_book(path, None) else { return vec![] };
+    let Some(ws) = b.book.get_sheet_by_name(sheet) else { return vec![] };
+    let (fc, rc) = (letters_to_col(find.trim()), letters_to_col(ret.trim()));
+    if fc == 0 || rc == 0 {
+        return vec![];
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in 1..=ws.get_highest_row() {
+        let k = clean(&ws.get_value((fc, row)));
+        let v = clean(&ws.get_value((rc, row)));
+        if !k.is_empty() && !v.is_empty() && seen.insert(k.to_lowercase()) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
 fn load_lookups(book: &Book, plan: &[(u32, String, String)]) -> Lookups {
     let mut out = Lookups::new();
     if book.csv_delim.is_some() {

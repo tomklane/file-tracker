@@ -478,6 +478,67 @@ impl App {
         }
     }
 
+    /// Stop using the spreadsheet but keep its columns and what fills them,
+    /// so the grid works from the folder alone. Lookups in other sheets are
+    /// copied into the rules as lists, because that sheet won't be there.
+    fn leave_spreadsheet(&mut self) {
+        let from_sheet = self.s.sheet_mode == "existing" && !self.rows.is_empty();
+        if from_sheet {
+            let path = PathBuf::from(self.s.sheet_path.trim());
+            let mut copied = 0;
+            for r in &mut self.rows {
+                if r.field != "extract" {
+                    continue;
+                }
+                let mut rule = extract::parse(&r.param);
+                if !rule.lookup {
+                    continue;
+                }
+                let pairs = read_lookup_pairs(&path, &rule.lookup_sheet, &rule.lookup_find, &rule.lookup_return);
+                if pairs.is_empty() {
+                    continue;
+                }
+                let mut list: Vec<String> = extract::list_pairs(&rule.replace_list).into_iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                list.extend(pairs.iter().map(|(k, v)| format!("{k} = {v}")));
+                rule.replace_list = list.join("\n");
+                rule.replace = true;
+                rule.lookup = false;
+                r.param = extract::to_param(&rule);
+                copied += 1;
+            }
+            let mut cols: Vec<(u32, String)> = self.rows.iter().map(|r| (r.col, r.header.replace([',', ';'], " "))).collect();
+            cols.sort_by_key(|c| c.0);
+            // keep the column positions, so a paste still lines up with the sheet
+            let mut names = Vec::new();
+            let mut next = cols.first().map(|c| c.0).unwrap_or(1);
+            for (col, h) in cols {
+                while next < col {
+                    names.push(format!("(column {})", col_letter(next)));
+                    next += 1;
+                }
+                names.push(h);
+                next = col + 1;
+            }
+            self.remember_mapping();
+            for r in &self.rows {
+                let h = r.header.replace([',', ';'], " ");
+                if h != r.header {
+                    self.s.mapping.insert(clean(&h), (r.field.clone(), r.param.clone()));
+                }
+            }
+            self.s.new_columns = names.join(", ");
+            self.status = format!(
+                "Using the spreadsheet's columns without the file{}.",
+                if copied > 0 { ", with the lookup lists copied into the columns" } else { "" }
+            );
+        }
+        self.s.sheet_mode = "new".into();
+        self.apply_sheet_mode(false);
+        if from_sheet {
+            self.grid.copy_msg = "No spreadsheet needed now: the grid comes from the folder. Copy and paste it into your sheet.".into();
+        }
+    }
+
     // ------------------------------------------------------------ setups library
 
     pub(crate) fn refresh_setups(&mut self) {
@@ -1089,6 +1150,8 @@ impl App {
         let row = sorting::row_number(d, order, ranks, first);
         let target = if self.s.copy_headers {
             "Paste into the top-left cell of an empty sheet".to_string()
+        } else if !d.from_sheet {
+            format!("Click the cell in column {} of the first empty row in your sheet and paste with {}", d.letters[c0], paste_keys())
         } else if old == nr {
             format!("These rows are already in your sheet (from row {row})")
         } else if old > 0 {
@@ -1341,10 +1404,7 @@ impl App {
                 }
             }
             Action::ReloadColumns(detect) => self.load_columns(detect, false),
-            Action::UseNewColumns => {
-                self.s.sheet_mode = "new".into();
-                self.apply_sheet_mode(false);
-            }
+            Action::UseNewColumns => self.leave_spreadsheet(),
             Action::ApplySheetMode => self.apply_sheet_mode(false),
             Action::NewSetup => self.name_prompt = Some(NamePrompt { rename: false, text: String::new(), focus: true }),
             Action::RenameSetup if !self.s.active_setup.is_empty() => {

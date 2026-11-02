@@ -64,7 +64,13 @@ impl App {
                     self.pending = Some(Action::BrowseSheet);
                     ui.close();
                 }
-                if self.s.sheet_mode != "new" && ui.button("Start from new columns instead").clicked() {
+                let leave_label = if self.rows.is_empty() { "Start from new columns instead" } else { "Use these columns without the spreadsheet" };
+                if self.s.sheet_mode != "new"
+                    && ui
+                        .button(leave_label)
+                        .on_hover_text("The grid keeps these columns and fills them from the folder alone, for you to copy. No spreadsheet file needed.")
+                        .clicked()
+                {
                     self.pending = Some(Action::UseNewColumns);
                     ui.close();
                 }
@@ -326,11 +332,15 @@ impl App {
                             "Already in your sheet on row {} · right-click for more",
                             sorting::row_number(d, &self.grid.order, &self.grid.ranks, r)
                         ),
+                        Some((_, c)) if !d.from_sheet => {
+                            format!("Paste into column {} of your sheet · right-click for more", letter(c))
+                        }
                         Some((r, c)) => format!(
                             "Paste at cell {}{} · right-click for more",
                             letter(c),
                             sorting::row_number(d, &self.grid.order, &self.grid.ranks, r)
                         ),
+                        None if !d.from_sheet => "Copy, then paste at column A of the first empty row in your sheet".to_string(),
                         None if d.new_rows() > 0 => format!("Paste new rows at cell {}{} · right-click for more", letter(0), d.start_row),
                         None => "Nothing new to paste · right-click for more".to_string(),
                     }
@@ -406,8 +416,14 @@ impl App {
             if ui.radio_value(&mut self.s.sheet_mode, "existing".into(), "Use my spreadsheet's columns (.xlsx, .xlsm, .csv)").changed() {
                 self.pending = Some(Action::ApplySheetMode);
             }
-            if ui.radio_value(&mut self.s.sheet_mode, "new".into(), "Use my own columns (no spreadsheet yet)").changed() {
-                self.pending = Some(Action::ApplySheetMode);
+            let own = self.s.sheet_mode == "new";
+            if ui
+                .radio(own, "Use my own columns (no spreadsheet file)")
+                .on_hover_text("With a spreadsheet's columns showing, they're kept: the grid fills them from the folder alone")
+                .clicked()
+                && !own
+            {
+                self.pending = Some(Action::UseNewColumns);
             }
             if self.s.sheet_mode == "existing" {
                 ui.horizontal(|ui| {
